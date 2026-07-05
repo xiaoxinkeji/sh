@@ -18,7 +18,6 @@ CLOUDFLARED_TOKEN=""
 INSTALL_CF=true
 INSTALL_LUCKY=true
 INSTALL_3XUI=true
-LOG_FILE="/var/log/setup-services.log"
 CONF_DIR="/etc/services-deploy"
 TMP_FILES=()
 
@@ -38,28 +37,12 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
-# ---------- 日志: 同时输出终端和文件 ----------
-_log() {
-    local level="$1"; shift
-    local msg="$*"
-    local ts
-    ts="$(date '+%Y-%m-%d %H:%M:%S')"
-    # 终端带颜色
-    case "$level" in
-        INFO)  echo -e "${BLUE}[INFO]${NC}  $msg" ;;
-        OK)    echo -e "${GREEN}[ OK ]${NC} $msg" ;;
-        WARN)  echo -e "${YELLOW}[WARN]${NC}  $msg" ;;
-        FAIL)  echo -e "${RED}[FAIL]${NC} $msg" ;;
-    esac
-    # 写文件 (纯文本, 无 ANSI)
-    echo "[$ts] [$level] $msg" >> "$LOG_FILE" 2>/dev/null || true
-}
-
-log_info()    { _log INFO  "$*"; }
-log_success() { _log OK    "$*"; }
-log_warn()    { _log WARN  "$*"; }
-log_error()   { _log FAIL  "$*"; }
-log_step()    { echo -e "\n${CYAN}${BOLD}━━━ $* ━━━${NC}"; echo "" >> "$LOG_FILE"; _log INFO "=== $* ==="; }
+# ---------- 日志 ----------
+log_info()    { echo -e "${BLUE}[INFO]${NC}  $*"; }
+log_success() { echo -e "${GREEN}[ OK ]${NC} $*"; }
+log_warn()    { echo -e "${YELLOW}[WARN]${NC}  $*"; }
+log_error()   { echo -e "${RED}[FAIL]${NC} $*"; }
+log_step()    { echo -e "\n${CYAN}${BOLD}━━━ $* ━━━${NC}"; }
 divider()     { echo -e "${BLUE}──────────────────────────────────────────────────────${NC}"; }
 
 # ---------- 带重试的下载 ----------
@@ -186,7 +169,6 @@ detect_os() {
     log_info "  包管理器:   ${PKG_MGR}"
     log_info "  Init 系统:  ${BOLD}${INIT_SYSTEM}${NC}"
     log_info "  内核版本:   $(uname -r)"
-    log_info "  日志文件:   ${LOG_FILE}"
     divider
 }
 
@@ -650,7 +632,7 @@ install_cloudflared() {
     if svc_status cloudflared /usr/local/bin/cloudflared; then
         log_success "Cloudflared 服务运行正常"
     else
-        log_warn "Cloudflared 服务状态异常, 请检查日志: tail -20 $LOG_FILE"
+        log_warn "Cloudflared 服务状态异常, 请检查进程"
     fi
 }
 
@@ -1085,7 +1067,6 @@ show_status() {
             log_info "  当前无 init 系统, 请手动管理进程"
             ;;
     esac
-    log_info "安装日志:  ${LOG_FILE}"
     echo ""
 }
 
@@ -1112,10 +1093,6 @@ _print_svc_status() {
 # ============================================================================
 
 main() {
-    # 初始化日志文件
-    mkdir -p "$(dirname "$LOG_FILE")"
-    echo "===== setup.sh v${SCRIPT_VERSION} started at $(date) =====" >> "$LOG_FILE"
-
     echo ""
     echo -e "${CYAN}${BOLD}"
     echo "  ╔══════════════════════════════════════════════╗"
@@ -1153,7 +1130,6 @@ main() {
     show_status
 
     log_success "${BOLD}全部服务部署完成!${NC}"
-    log_info "完整日志: ${LOG_FILE}"
     echo ""
 }
 

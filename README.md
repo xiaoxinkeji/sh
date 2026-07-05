@@ -51,7 +51,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/xiaoxinkeji/sh/main/setup.sh
 
 **安全:** Cloudflared Token 存入独立配置文件 (权限 600)，不硬编码到 init.d 脚本中。
 
-**健壮性:** 网络连通性预检、下载重试 (3 次)、磁盘空间检查、文件日志 (`/var/log/setup-services.log`)、信号捕获清理临时文件。
+**健壮性:** 网络连通性预检、下载重试 (3 次)、磁盘空间检查、信号捕获清理临时文件。
 
 **精确进程检测:** 使用二进制路径精确匹配，避免 `pgrep -f` 误杀同名进程。
 
@@ -73,8 +73,6 @@ journalctl -u lucky -f                      # 查看实时日志
 rc-service cloudflared status               # 查看状态
 rc-service lucky restart                    # 重启服务
 ```
-
-安装日志保存在 `/var/log/setup-services.log`。
 
 ## License
 

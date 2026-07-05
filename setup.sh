@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ============================================================================
-#  多服务一键部署脚本  v3.4.0
+#  多服务一键部署脚本  v3.5.0
 #  集成: Cloudflared Tunnel / Lucky(幸运加速) / 3x-ui (X-UI)
 #
 #  Init 支持: systemd / sysvinit / OpenRC
@@ -13,7 +13,7 @@
 set -uo pipefail
 
 # ========================== 全局变量 ==========================
-SCRIPT_VERSION="3.4.1"
+SCRIPT_VERSION="3.5.0"
 CLOUDFLARED_TOKEN=""
 INSTALL_CF=true
 INSTALL_LUCKY=true
@@ -229,6 +229,32 @@ _auto_extract_cf_token() {
     return 1
 }
 
+# ---------- Token 清洗: 从各种格式中提取真正的 base64 token ----------
+_sanitize_cf_token() {
+    local raw="$1"
+    local token=""
+
+    # 尝试提取: 找最长的 base64url 字符串 (eyJ... 或类似)
+    # 支持用户粘贴: "cloudflared.exe service install eyJ..." / "cloudflared tunnel run --token eyJ..." / 纯 token
+    token="$(echo "$raw" | grep -oP 'eyJ[A-Za-z0-9_\-+/=]{50,}' | head -1)"
+
+    if [[ -n "$token" ]]; then
+        CLOUDFLARED_TOKEN="$token"
+        return 0
+    fi
+
+    # 如果没找到 eyJ 开头的, 尝试提取最后一个长单词 (可能是其他格式的 token)
+    token="$(echo "$raw" | awk '{print $NF}')"
+    if [[ ${#token} -ge 50 ]]; then
+        CLOUDFLARED_TOKEN="$token"
+        return 0
+    fi
+
+    # 原样返回
+    CLOUDFLARED_TOKEN="$raw"
+    return 1
+}
+
 # ---------- 交互式: 选择服务 + 输入 Token ----------
 interactive_prompt() {
     echo ""
@@ -282,21 +308,26 @@ interactive_prompt() {
                     log_warn "已跳过 Cloudflared"
                     ;;
                 *)
-                    # 用户输入了新 token
-                    CLOUDFLARED_TOKEN="$token_choice"
+                    # 用户输入了新 token, 自动清洗
+                    _sanitize_cf_token "$token_choice"
                     log_success "Token 已更新 (${#CLOUDFLARED_TOKEN} 字符)"
                     ;;
             esac
         else
             echo -e "${CYAN}请输入 Cloudflared Tunnel Token:${NC}"
             echo -e "(获取方式: Cloudflare Zero Trust Dashboard → Networks → Tunnels → 复制 token)"
+            echo -e "${YELLOW}提示: 可以直接粘贴整条命令, 脚本会自动提取 token${NC}"
             echo ""
-            read -rp "$(echo -e "${BLUE}[Token]${NC} ")" CLOUDFLARED_TOKEN
+            read -rp "$(echo -e "${BLUE}[Token]${NC} ")" raw_token
 
-            if [[ -z "$CLOUDFLARED_TOKEN" ]]; then
+            if [[ -z "$raw_token" ]]; then
                 log_warn "未输入 Token, 将跳过 Cloudflared 安装"
                 INSTALL_CF=false
             else
+                # 自动清洗: 从 "cloudflared.exe service install eyJ..." 中提取 token
+                if _sanitize_cf_token "$raw_token"; then
+                    log_info "已自动提取 Token (原始输入 ${#raw_token} 字符 → 清洗后 ${#CLOUDFLARED_TOKEN} 字符)"
+                fi
                 log_success "Token 已接收 (${#CLOUDFLARED_TOKEN} 字符)"
             fi
         fi
@@ -469,6 +500,38 @@ svc_status() {
     esac
 }
 
+# ---------- 直接启动 (绕过 init.d, 用于降级兜底) ----------
+# 用法: _direct_start <服务名> <二进制路径> [启动参数...]
+_direct_start() {
+    local name="$1" bin="$2"
+    shift 2
+    local args=("$@")
+    local pidfile="/var/run/${name}.pid"
+    local logfile="/var/log/${name}.log"
+
+    # 清理残留
+    pkill -x "$name" 2>/dev/null
+    sleep 1
+
+    log_info "尝试直接启动 ${name} (nohup 模式)..."
+    nohup "$bin" "${args[@]}" >> "$logfile" 2>&1 &
+    local pid=$!
+    echo "$pid" > "$pidfile"
+
+    sleep 3
+    if kill -0 "$pid" 2>/dev/null; then
+        log_success "${name} 直接启动成功 (PID: ${pid})"
+        return 0
+    fi
+
+    log_error "${name} 直接启动也失败了 (PID $pid 已退出)"
+    if [[ -s "$logfile" ]]; then
+        tail -5 "$logfile" 2>/dev/null | while IFS= read -r line; do echo "    $line"; done
+    fi
+    rm -f "$pidfile"
+    return 1
+}
+
 # 写入 /etc/rc.local 作为最后的自启兜底
 _add_to_rc_local() {
     local name="$1"
@@ -495,7 +558,7 @@ _add_to_rc_local() {
 # ============================================================================
 
 # 用法: _gen_initd_script <服务名> <描述> <可执行文件路径> <启动参数> <PID文件>
-# 内部自动检测 start-stop-daemon / daemon / nohup 可用哪种
+# 始终使用 nohup + shell 重定向, 最可靠, 日志一定能写入
 _gen_initd_script() {
     local name="$1" desc="$2" bin="$3" args="$4" pidfile="$5"
     local script="/etc/init.d/${name}"
@@ -515,92 +578,77 @@ NAME="${name}"
 DAEMON="${bin}"
 DAEMON_ARGS="${args}"
 PIDFILE="${pidfile}"
+LOGFILE="/var/log/\${NAME}.log"
 DESC="${desc}"
 
-# 读取系统函数库 (兼容 Debian / RedHat)
-if [ -f /lib/lsb/init-functions ]; then
-    . /lib/lsb/init-functions
-    LOG_DAEMON_MSG="log_daemon_msg"
-elif [ -f /etc/init.d/functions ]; then
-    . /etc/init.d/functions
-fi
-
-# 检测后台运行工具
-if command -v start-stop-daemon >/dev/null 2>&1; then
-    BG_TOOL="ssd"
-elif command -v daemon >/dev/null 2>&1; then
-    BG_TOOL="daemon"
-else
-    BG_TOOL="nohup"
-fi
+_is_running() {
+    if [ -f "\$PIDFILE" ]; then
+        local pid
+        pid=\$(cat "\$PIDFILE" 2>/dev/null)
+        if [ -n "\$pid" ] && kill -0 "\$pid" 2>/dev/null; then
+            return 0
+        fi
+        rm -f "\$PIDFILE"
+    fi
+    return 1
+}
 
 do_start() {
-    if [ -f "\$PIDFILE" ] && kill -0 \$(cat "\$PIDFILE") 2>/dev/null; then
-        echo "\$NAME is already running"
-        return 1
-    fi
-    echo "Starting \$DESC: \$NAME"
-
-    case "\$BG_TOOL" in
-        ssd)
-            start-stop-daemon --start --quiet --background --make-pidfile \\
-                --pidfile "\$PIDFILE" --exec "\$DAEMON" \\
-                --stdout "/var/log/\${NAME}.log" --stderr "/var/log/\${NAME}.log" \\
-                -- \$DAEMON_ARGS
-            ;;
-        daemon)
-            daemon --pidfile="\$PIDFILE" --name="\$NAME" \\
-                "\$DAEMON \$DAEMON_ARGS >> /var/log/\${NAME}.log 2>&1 &"
-            # daemon 可能不写 pidfile, 手动补
-            sleep 1
-            if [ ! -f "\$PIDFILE" ]; then
-                pgrep -x "\$(basename \$DAEMON)" > "\$PIDFILE" 2>/dev/null
-            fi
-            ;;
-        nohup)
-            nohup "\$DAEMON" \$DAEMON_ARGS >> "/var/log/\${NAME}.log" 2>&1 &
-            echo \$! > "\$PIDFILE"
-            ;;
-    esac
-
-    # 启动后验证: 确认进程没有立即崩溃
-    sleep 2
-    if [ -f "\$PIDFILE" ] && kill -0 \$(cat "\$PIDFILE") 2>/dev/null; then
+    if _is_running; then
+        echo "\$NAME is already running (PID: \$(cat \$PIDFILE))"
         return 0
     fi
-    echo "ERROR: \$NAME 启动后退出, 最近日志:"
-    tail -5 "/var/log/\${NAME}.log" 2>/dev/null || echo "(无日志)"
+
+    # 清理可能残留的同名进程
+    pkill -x "\$NAME" 2>/dev/null
+    sleep 1
+
+    echo "Starting \$DESC: \$NAME"
+
+    # 直接后台运行, stdout+stderr 都写入日志
+    nohup "\$DAEMON" \$DAEMON_ARGS >> "\$LOGFILE" 2>&1 &
+    local pid=\$!
+    echo \$pid > "\$PIDFILE"
+
+    # 启动后验证: 等 3 秒确认进程没有立即崩溃
+    sleep 3
+    if kill -0 "\$pid" 2>/dev/null; then
+        return 0
+    fi
+    # 进程已死, 输出日志帮助排查
+    echo "ERROR: \$NAME 启动后退出 (PID \$pid 已不存在), 最近日志:"
+    if [ -s "\$LOGFILE" ]; then
+        tail -10 "\$LOGFILE" 2>/dev/null
+    else
+        echo "(日志文件为空, 进程可能在启动瞬间就退出了)"
+    fi
     rm -f "\$PIDFILE"
     return 1
 }
 
 do_stop() {
-    if [ ! -f "\$PIDFILE" ] || ! kill -0 \$(cat "\$PIDFILE") 2>/dev/null; then
+    if ! _is_running; then
         echo "\$NAME is not running"
-        rm -f "\$PIDFILE"
+        pkill -x "\$NAME" 2>/dev/null
         return 0
     fi
     echo "Stopping \$DESC: \$NAME"
-    case "\$BG_TOOL" in
-        ssd)
-            start-stop-daemon --stop --quiet --pidfile "\$PIDFILE" --retry 10
-            ;;
-        *)
-            kill \$(cat "\$PIDFILE") 2>/dev/null
-            local i=0
-            while [ \$i -lt 10 ] && kill -0 \$(cat "\$PIDFILE" 2>/dev/null) 2>/dev/null; do
-                sleep 1; i=\$((i+1))
-            done
-            # 强制杀
-            kill -9 \$(cat "\$PIDFILE") 2>/dev/null
-            ;;
-    esac
+    local pid
+    pid=\$(cat "\$PIDFILE" 2>/dev/null)
+    kill "\$pid" 2>/dev/null
+    local i=0
+    while [ \$i -lt 10 ] && kill -0 "\$pid" 2>/dev/null; do
+        sleep 1; i=\$((i+1))
+    done
+    if kill -0 "\$pid" 2>/dev/null; then
+        kill -9 "\$pid" 2>/dev/null
+    fi
     rm -f "\$PIDFILE"
-    return \$?
+    return 0
 }
 
 do_status() {
-    if [ -f "\$PIDFILE" ] && kill -0 \$(cat "\$PIDFILE") 2>/dev/null; then
+    if _is_running; then
         echo "\$NAME is running (PID: \$(cat \$PIDFILE))"
         return 0
     fi
@@ -749,7 +797,7 @@ install_cloudflared() {
     svc_stop cloudflared 2>/dev/null
     sleep 1
 
-    # 直接调用 init.d 脚本启动 (能看到其输出, 包括错误信息)
+    # 先尝试 init.d 启动
     local start_rc=0
     if [[ "$INIT_SYSTEM" == "sysvinit" || "$INIT_SYSTEM" == "openrc" ]]; then
         "/etc/init.d/cloudflared" start || start_rc=$?
@@ -758,22 +806,18 @@ install_cloudflared() {
     fi
 
     if (( start_rc != 0 )); then
-        # init.d 脚本已经输出了错误信息和日志
-        log_error "Cloudflared 启动失败 (init.d 返回码: ${start_rc})"
-        log_warn "请检查: 1) Token 是否正确  2) 网络是否通畅  3) gvisor/容器兼容性"
+        # init.d 失败, 降级: 直接用 nohup 启动
+        log_warn "init.d 启动失败, 尝试直接启动..."
+        _direct_start cloudflared /usr/local/bin/cloudflared \
+            tunnel --no-autoupdate run --token "$CLOUDFLARED_TOKEN"
     else
-        # 启动成功, 再做一轮快速确认
+        # init.d 启动成功, 再做一轮快速确认
         sleep 2
         if svc_status cloudflared /usr/local/bin/cloudflared; then
             log_success "Cloudflared 服务运行正常"
         else
             log_error "Cloudflared 启动后进程消失"
-            if [[ -f /var/log/cloudflared.log ]]; then
-                log_info "最近日志:"
-                tail -10 /var/log/cloudflared.log 2>/dev/null | while IFS= read -r line; do
-                    echo "    $line"
-                done
-            fi
+            [[ -f /var/log/cloudflared.log ]] && tail -10 /var/log/cloudflared.log 2>/dev/null | while IFS= read -r line; do echo "    $line"; done
         fi
     fi
 }
@@ -1007,8 +1051,8 @@ install_lucky() {
     fi
 
     if (( start_rc != 0 )); then
-        log_error "Lucky 启动失败 (返回码: ${start_rc})"
-        [[ -f /var/log/lucky.log ]] && tail -5 /var/log/lucky.log 2>/dev/null | while IFS= read -r line; do echo "    $line"; done
+        log_warn "init.d 启动失败, 尝试直接启动..."
+        _direct_start lucky /usr/local/bin/lucky -cd /etc/lucky
     else
         sleep 2
         if svc_status lucky /usr/local/bin/lucky; then
@@ -1142,7 +1186,6 @@ install_3xui() {
     # ---------- 已安装检测 ----------
     if [[ -f /usr/local/x-ui/x-ui ]]; then
         log_info "3x-ui 已安装"
-        # 先确保服务脚本存在 (官方脚本可能只创建了 systemd unit)
         _ensure_3xui_service
         if svc_status x-ui /usr/local/x-ui/x-ui; then
             log_success "3x-ui 服务已在运行"
@@ -1151,12 +1194,18 @@ install_3xui() {
         # 未运行, 尝试启动
         svc_stop x-ui 2>/dev/null
         sleep 1
-        svc_start x-ui
-        sleep 3
-        if svc_status x-ui /usr/local/x-ui/x-ui; then
+        local start_rc=0
+        if [[ -x /etc/init.d/x-ui ]]; then
+            /etc/init.d/x-ui start || start_rc=$?
+        else
+            svc_start x-ui || start_rc=$?
+        fi
+        if (( start_rc != 0 )); then
+            _direct_start x-ui /usr/local/x-ui/x-ui
+        elif svc_status x-ui /usr/local/x-ui/x-ui; then
             log_success "3x-ui 服务已启动"
         else
-            log_warn "3x-ui 启动失败, 请检查: /etc/init.d/x-ui start"
+            log_warn "3x-ui 启动后进程消失, 请检查日志"
         fi
         return 0
     fi
@@ -1195,8 +1244,8 @@ install_3xui() {
     fi
 
     if (( start_rc != 0 )); then
-        log_error "3x-ui 启动失败 (返回码: ${start_rc})"
-        [[ -f /var/log/x-ui.log ]] && tail -5 /var/log/x-ui.log 2>/dev/null | while IFS= read -r line; do echo "    $line"; done
+        log_warn "init.d 启动失败, 尝试直接启动..."
+        _direct_start x-ui /usr/local/x-ui/x-ui
     else
         sleep 3
         if svc_status x-ui /usr/local/x-ui/x-ui; then

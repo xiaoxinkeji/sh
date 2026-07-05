@@ -15,9 +15,13 @@
 
 ```bash
 curl -fsSLO https://raw.githubusercontent.com/xiaoxinkeji/sh/main/setup.sh
-chmod +x setup.sh
-sudo bash setup.sh <your_cloudflared_token>
+sudo bash setup.sh
 ```
+
+脚本启动后会进入交互式菜单:
+
+1. 选择要安装的服务 (支持多选, 直接回车全选)
+2. 如果选择了 Cloudflared, 按提示粘贴 Token
 
 Token 获取: [Cloudflare Zero Trust Dashboard](https://one.dash.cloudflare.com/) → Networks → Tunnels → 复制 token
 

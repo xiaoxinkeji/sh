@@ -7,14 +7,17 @@
 #  发行版:    Ubuntu Debian CentOS RHEL Fedora Arch Alpine OpenWrt openSUSE
 #  架构:      amd64 arm64 arm 386
 #
-#  用法: sudo bash setup.sh <cloudflared_token>
+#  用法: sudo bash setup.sh
 # ============================================================================
 
 set -uo pipefail
 
 # ========================== 全局变量 ==========================
-SCRIPT_VERSION="3.0.0"
-CLOUDFLARED_TOKEN="${1:-}"
+SCRIPT_VERSION="3.1.0"
+CLOUDFLARED_TOKEN=""
+INSTALL_CF=true
+INSTALL_LUCKY=true
+INSTALL_3XUI=true
 LOG_FILE="/var/log/setup-services.log"
 CONF_DIR="/etc/services-deploy"
 TMP_FILES=()
@@ -197,24 +200,67 @@ _systemd_works() {
 check_root() {
     if [[ $EUID -ne 0 ]]; then
         log_error "此脚本需要 root 权限运行"
-        echo "请使用: sudo bash $0 <token>"
+        echo "请使用: sudo bash $0"
         exit 1
     fi
 }
 
-check_args() {
-    if [[ -z "$CLOUDFLARED_TOKEN" ]]; then
-        log_error "缺少 Cloudflared Token 参数"
-        echo ""
-        echo "用法: sudo bash $0 <cloudflared_token>"
-        echo "示例: sudo bash $0 eyJhIjoi..."
-        echo ""
-        echo "Token 获取方式:"
-        echo "  1. 登录 Cloudflare Zero Trust Dashboard"
-        echo "  2. Networks → Tunnels → 创建/选择 Tunnel"
-        echo "  3. 复制安装命令中的 token"
-        exit 1
+# ---------- 交互式: 选择服务 + 输入 Token ----------
+interactive_prompt() {
+    echo ""
+    echo -e "${CYAN}${BOLD}请选择要安装的服务 (直接回车 = 全部安装):${NC}"
+    echo ""
+    echo -e "  ${GREEN}1${NC}) Cloudflared Tunnel   — Cloudflare 内网穿透隧道"
+    echo -e "  ${GREEN}2${NC}) Lucky (幸运加速)      — DDNS / 端口转发 / 反向代理"
+    echo -e "  ${GREEN}3${NC}) 3x-ui (X-UI 面板)    — 多协议代理面板"
+    echo ""
+    echo -e "  输入编号, 多选逗号分隔 (如 ${BOLD}1,3${NC}), 或直接回车全选"
+    echo ""
+    read -rp "$(echo -e "${BLUE}[选择]${NC} ")" choice
+
+    if [[ -n "$choice" ]]; then
+        INSTALL_CF=false
+        INSTALL_LUCKY=false
+        INSTALL_3XUI=false
+
+        # 解析选择 (支持 1,3 或 1 3 或 1,2,3 等格式)
+        choice="${choice// /,}"
+        IFS=',' read -ra items <<< "$choice"
+        for item in "${items[@]}"; do
+            case "$item" in
+                1) INSTALL_CF=true ;;
+                2) INSTALL_LUCKY=true ;;
+                3) INSTALL_3XUI=true ;;
+                *) log_warn "忽略未知选项: $item" ;;
+            esac
+        done
     fi
+
+    # 显示已选服务
+    echo ""
+    log_info "已选服务:"
+    $INSTALL_CF    && log_success "  Cloudflared Tunnel"
+    $INSTALL_LUCKY && log_success "  Lucky (幸运加速)"
+    $INSTALL_3XUI  && log_success "  3x-ui (X-UI 面板)"
+    echo ""
+
+    # 如果选了 Cloudflared, 提示输入 Token
+    if $INSTALL_CF; then
+        echo -e "${CYAN}请输入 Cloudflared Tunnel Token:${NC}"
+        echo -e "(获取方式: Cloudflare Zero Trust Dashboard → Networks → Tunnels → 复制 token)"
+        echo ""
+        read -rp "$(echo -e "${BLUE}[Token]${NC} ")" CLOUDFLARED_TOKEN
+
+        if [[ -z "$CLOUDFLARED_TOKEN" ]]; then
+            log_warn "未输入 Token, 将跳过 Cloudflared 安装"
+            INSTALL_CF=false
+        else
+            log_success "Token 已接收 (${#CLOUDFLARED_TOKEN} 字符)"
+        fi
+    fi
+
+    echo ""
+    divider
 }
 
 # ============================================================================
@@ -1080,15 +1126,30 @@ main() {
     echo -e "${NC}"
 
     check_root
-    check_args
+    interactive_prompt
     detect_os
     check_disk_space
     check_network
     install_dependencies
 
-    install_cloudflared
-    install_lucky
-    install_3xui
+    # 根据用户选择安装服务
+    if $INSTALL_CF; then
+        install_cloudflared
+    else
+        log_info "跳过 Cloudflared (未选择)"
+    fi
+
+    if $INSTALL_LUCKY; then
+        install_lucky
+    else
+        log_info "跳过 Lucky (未选择)"
+    fi
+
+    if $INSTALL_3XUI; then
+        install_3xui
+    else
+        log_info "跳过 3x-ui (未选择)"
+    fi
 
     show_status
 

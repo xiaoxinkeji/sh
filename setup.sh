@@ -13,7 +13,7 @@
 set -uo pipefail
 
 # ========================== 全局变量 ==========================
-SCRIPT_VERSION="3.2.0"
+SCRIPT_VERSION="3.2.1"
 CLOUDFLARED_TOKEN=""
 INSTALL_CF=true
 INSTALL_LUCKY=true
@@ -1111,7 +1111,10 @@ _print_svc_status() {
     local display="$1" svc_name="$2" bin_path="$3"
     local installed=false
 
-    [[ -x "$bin_path" ]] && installed=true
+    # 文件存在 OR 在 PATH 中能找到, 都算已安装
+    if [[ -x "$bin_path" ]] || command -v "$svc_name" &>/dev/null; then
+        installed=true
+    fi
 
     printf "  %-22s : " "$display"
     if $installed; then

@@ -8,7 +8,17 @@
 bash <(curl -fsSL https://raw.githubusercontent.com/xiaoxinkeji/sh/main/setup.sh)
 ```
 
-脚本会自动请求 root 权限，启动后进入交互式菜单选择要安装的服务。
+脚本会自动请求 root 权限，启动后进入交互式菜单选择要安装的服务。已安装的服务会自动标注 `[已安装]`。
+
+## 其他用法
+
+```bash
+# 查看服务状态
+bash setup.sh --status
+
+# 卸载服务 (交互式选择)
+bash setup.sh --uninstall
+```
 
 ## 兼容性
 
@@ -45,15 +55,17 @@ bash <(curl -fsSL https://raw.githubusercontent.com/xiaoxinkeji/sh/main/setup.sh
 
 ## 脚本特性
 
+**一体化:** 安装、卸载、状态查看全部集成在一个脚本中。`--uninstall` 不再需要下载远程脚本，`--status` 快速查看运行状态。
+
 **环境自适应:** 自动检测操作系统、架构、包管理器和 init 系统。精简系统 (Alpine / OpenWrt) 也能正常运行。
 
-**Init 三层降级:** systemd → OpenRC → sysvinit → 无 init。无 systemd 时自动生成 `/etc/init.d/` 脚本，init.d 脚本内部还会自动检测 `start-stop-daemon` / `daemon` / `nohup` 哪种可用。
+**Init 三层降级:** systemd → OpenRC → sysvinit → 无 init。无 systemd 时自动生成 `/etc/init.d/` 脚本，启动失败时自动降级为 nohup 直接启动。
 
 **安全:** Cloudflared Token 存入独立配置文件 (权限 600)，不硬编码到 init.d 脚本中。
 
 **健壮性:** 网络连通性预检、下载重试 (3 次)、磁盘空间检查、信号捕获清理临时文件。
 
-**精确进程检测:** 使用二进制路径精确匹配，避免 `pgrep -f` 误杀同名进程。
+**精确进程检测:** 使用 `/proc/<pid>/exe` 验证二进制路径，避免 `pgrep` 误判同名进程。
 
 ## 安装后管理
 

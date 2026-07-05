@@ -1,19 +1,22 @@
 #!/usr/bin/env bash
 # ============================================================================
-#  多服务一键部署脚本  v3.5.0
+#  多服务一键部署脚本  v4.0.0
 #  集成: Cloudflared Tunnel / Lucky(幸运加速) / 3x-ui (X-UI)
 #
 #  Init 支持: systemd / sysvinit / OpenRC
 #  发行版:    Ubuntu Debian CentOS RHEL Fedora Arch Alpine OpenWrt openSUSE
 #  架构:      amd64 arm64 arm 386
 #
-#  用法: sudo bash setup.sh
+#  用法:
+#    sudo bash setup.sh              # 安装模式
+#    sudo bash setup.sh --status     # 查看服务状态
+#    sudo bash setup.sh --uninstall  # 卸载服务
 # ============================================================================
 
 set -uo pipefail
 
 # ========================== 全局变量 ==========================
-SCRIPT_VERSION="3.5.1"
+SCRIPT_VERSION="4.0.0"
 CLOUDFLARED_TOKEN=""
 INSTALL_CF=true
 INSTALL_LUCKY=true
@@ -24,13 +27,6 @@ TMP_FILES=()
 # 颜色
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
 BLUE='\033[0;34m'; CYAN='\033[0;36m'; BOLD='\033[1m'; NC='\033[0m'
-
-# ---------- --uninstall 快捷入口 ----------
-if [[ "${1:-}" == "--uninstall" || "${1:-}" == "-u" ]]; then
-    echo -e "${YELLOW}正在下载卸载脚本...${NC}"
-    bash <(curl -fsSL https://raw.githubusercontent.com/xiaoxinkeji/sh/main/uninstall.sh)
-    exit $?
-fi
 
 # ============================================================================
 #                          基础设施
@@ -193,6 +189,73 @@ check_root() {
     fi
 }
 
+# 静默版 detect_os, 不打印输出 (用于 --uninstall / --status 入口)
+detect_os_silent() {
+    OS=""; OS_ID=""; OS_VER=""; ARCH=""; PKG_MGR=""; INIT_SYSTEM=""
+    if [[ -f /etc/os-release ]]; then
+        . /etc/os-release
+        OS="${NAME:-Unknown}"; OS_ID="${ID:-unknown}"; OS_VER="${VERSION_ID:-}"
+    elif [[ -f /etc/redhat-release ]]; then
+        OS="RedHat"; OS_ID="rhel"
+    elif [[ -f /etc/debian_version ]]; then
+        OS="Debian"; OS_ID="debian"; OS_VER="$(cat /etc/debian_version)"
+    elif [[ -f /etc/alpine-release ]]; then
+        OS="Alpine Linux"; OS_ID="alpine"; OS_VER="$(cat /etc/alpine-release)"
+    elif [[ -f /etc/openwrt_release ]]; then
+        OS="OpenWrt"; OS_ID="openwrt"
+    else
+        OS="$(uname -s)"; OS_ID="unknown"
+    fi
+    local raw_arch
+    raw_arch="$(uname -m)"
+    case "$raw_arch" in
+        x86_64)             ARCH="amd64" ;;
+        aarch64|arm64)      ARCH="arm64" ;;
+        armv7l|armhf|armv7) ARCH="arm"   ;;
+        i386|i686)          ARCH="386"   ;;
+        *)                  ARCH="$raw_arch" ;;
+    esac
+    if   command -v apt-get  &>/dev/null; then PKG_MGR="apt"
+    elif command -v dnf      &>/dev/null; then PKG_MGR="dnf"
+    elif command -v yum      &>/dev/null; then PKG_MGR="yum"
+    elif command -v pacman   &>/dev/null; then PKG_MGR="pacman"
+    elif command -v zypper   &>/dev/null; then PKG_MGR="zypper"
+    elif command -v apk      &>/dev/null; then PKG_MGR="apk"
+    elif command -v opkg     &>/dev/null; then PKG_MGR="opkg"
+    else PKG_MGR="none"; fi
+    if _systemd_works; then
+        INIT_SYSTEM="systemd"
+    elif command -v rc-service &>/dev/null && [[ -d /etc/init.d ]]; then
+        INIT_SYSTEM="openrc"
+    elif [[ -d /etc/init.d ]] || command -v service &>/dev/null; then
+        INIT_SYSTEM="sysvinit"
+    else
+        INIT_SYSTEM="none"
+    fi
+}
+
+# 显示 Banner (动态居中版本号)
+show_banner() {
+    local ver="v${SCRIPT_VERSION}"
+    local title="多服务一键部署脚本  ${ver}"
+    local title_len=${#title}
+    local box_inner=46
+    local pad_total=$(( box_inner - title_len ))
+    (( pad_total < 0 )) && pad_total=0
+    local pad_left=$(( pad_total / 2 ))
+    local pad_right=$(( pad_total - pad_left ))
+    local lpad="" rpad=""
+    printf -v lpad '%*s' "$pad_left" ''
+    printf -v rpad '%*s' "$pad_right" ''
+    echo ""
+    echo -e "${CYAN}${BOLD}"
+    echo "  ╔══════════════════════════════════════════════╗"
+    echo "  ║${lpad}${title}${rpad}║"
+    echo "  ║  Cloudflared · Lucky · 3x-ui                ║"
+    echo "  ╚══════════════════════════════════════════════╝"
+    echo -e "${NC}"
+}
+
 # ---------- 自动从已安装的 cloudflared 提取 Token ----------
 _auto_extract_cf_token() {
     local token=""
@@ -255,14 +318,26 @@ _sanitize_cf_token() {
     return 1
 }
 
+# ---------- 检测服务是否已安装 ----------
+_is_installed() {
+    local svc_name="$1" bin_path="$2"
+    [[ -x "$bin_path" ]] || command -v "$svc_name" &>/dev/null
+}
+
 # ---------- 交互式: 选择服务 + 输入 Token ----------
 interactive_prompt() {
+    # 检测各服务是否已安装, 用于菜单标注
+    local cf_tag="" lucky_tag="" xui_tag=""
+    _is_installed cloudflared /usr/local/bin/cloudflared && cf_tag="  ${GREEN}[已安装]${NC}"
+    _is_installed lucky /usr/local/bin/lucky             && lucky_tag="  ${GREEN}[已安装]${NC}"
+    _is_installed x-ui /usr/local/x-ui/x-ui             && xui_tag="  ${GREEN}[已安装]${NC}"
+
     echo ""
     echo -e "${CYAN}${BOLD}请选择要安装的服务 (直接回车 = 全部安装):${NC}"
     echo ""
-    echo -e "  ${GREEN}1${NC}) Cloudflared Tunnel   — Cloudflare 内网穿透隧道"
-    echo -e "  ${GREEN}2${NC}) Lucky (幸运加速)      — DDNS / 端口转发 / 反向代理"
-    echo -e "  ${GREEN}3${NC}) 3x-ui (X-UI 面板)    — 多协议代理面板"
+    echo -e "  ${GREEN}1${NC}) Cloudflared Tunnel   — Cloudflare 内网穿透隧道${cf_tag}"
+    echo -e "  ${GREEN}2${NC}) Lucky (幸运加速)      — DDNS / 端口转发 / 反向代理${lucky_tag}"
+    echo -e "  ${GREEN}3${NC}) 3x-ui (X-UI 面板)    — 多协议代理面板${xui_tag}"
     echo ""
     echo -e "  输入编号, 多选逗号分隔 (如 ${BOLD}1,3${NC}), 或直接回车全选"
     echo ""
@@ -1358,28 +1433,78 @@ show_status() {
     _print_svc_status "Lucky (幸运加速)"   "lucky"       "/usr/local/bin/lucky"
     _print_svc_status "3x-ui (X-UI 面板)"  "x-ui"        "/usr/local/x-ui/x-ui"
 
-    divider
-    echo ""
-    log_info "管理命令 (${INIT_SYSTEM}):"
-    case "$INIT_SYSTEM" in
-        systemd)
-            log_info "  查看状态:  systemctl status <cloudflared|lucky|x-ui>"
-            log_info "  重启服务:  systemctl restart <服务名>"
-            log_info "  查看日志:  journalctl -u <服务名> -f"
-            ;;
-        sysvinit)
-            log_info "  查看状态:  /etc/init.d/<服务名> status"
-            log_info "  重启服务:  /etc/init.d/<服务名> restart"
-            log_info "  查看日志:  tail -f /var/log/<服务名>.log"
-            ;;
-        openrc)
-            log_info "  查看状态:  rc-service <服务名> status"
-            log_info "  重启服务:  rc-service <服务名> restart"
-            ;;
-        *)
-            log_info "  当前无 init 系统, 请手动管理进程"
-            ;;
-    esac
+    # ---------- 显示访问信息 ----------
+    local has_access_info=false
+
+    # 3x-ui 凭据
+    if _is_installed x-ui /usr/local/x-ui/x-ui && [[ -f /etc/x-ui/install-result.env ]]; then
+        echo ""
+        divider
+        log_info "${BOLD}3x-ui 面板信息${NC}"
+        local xui_user xui_pass xui_port xui_path xui_ip
+        xui_user="$(grep -oP '^XUI_USER=\K.*' /etc/x-ui/install-result.env 2>/dev/null)"
+        xui_pass="$(grep -oP '^XUI_PASS=\K.*' /etc/x-ui/install-result.env 2>/dev/null)"
+        xui_port="$(grep -oP '^XUI_PORT=\K.*' /etc/x-ui/install-result.env 2>/dev/null)"
+        xui_path="$(grep -oP '^XUI_BASE_PATH=\K.*' /etc/x-ui/install-result.env 2>/dev/null)"
+        xui_ip="$(curl -s --max-time 3 ifconfig.me 2>/dev/null || hostname -I | awk '{print $1}')"
+        if [[ -n "$xui_port" ]]; then
+            has_access_info=true
+            echo -e "  ${CYAN}访问地址:${NC}  http://${xui_ip}:${xui_port}/${xui_path}"
+            echo -e "  ${CYAN}用户名:${NC}    ${BOLD}${xui_user}${NC}"
+            echo -e "  ${CYAN}密码:${NC}      ${BOLD}${xui_pass}${NC}"
+            echo -e "  ${YELLOW}⚠ 请妥善保存以上凭据!${NC}"
+        fi
+    fi
+
+    # Lucky 管理页面
+    if _is_installed lucky /usr/local/bin/lucky; then
+        local lucky_port=""
+        # Lucky 默认端口 16601
+        if [[ -f /etc/lucky/lucky.conf ]]; then
+            lucky_port="$(grep -oP '"port"\s*:\s*\K[0-9]+' /etc/lucky/lucky.conf 2>/dev/null)"
+        fi
+        lucky_port="${lucky_port:-16601}"
+        if [[ -z "$has_access_info" ]] || true; then
+            echo ""
+            divider
+            log_info "${BOLD}Lucky 管理页面${NC}"
+            local lucky_ip
+            lucky_ip="$(curl -s --max-time 3 ifconfig.me 2>/dev/null || hostname -I | awk '{print $1}')"
+            echo -e "  ${CYAN}访问地址:${NC}  http://${lucky_ip}:${lucky_port}"
+        fi
+    fi
+
+    # ---------- 管理命令 (只显示已安装服务的) ----------
+    local installed_svcs=()
+    _is_installed cloudflared /usr/local/bin/cloudflared && installed_svcs+=("cloudflared")
+    _is_installed lucky /usr/local/bin/lucky             && installed_svcs+=("lucky")
+    _is_installed x-ui /usr/local/x-ui/x-ui             && installed_svcs+=("x-ui")
+
+    if (( ${#installed_svcs[@]} > 0 )); then
+        echo ""
+        divider
+        log_info "管理命令 (${INIT_SYSTEM}):"
+        local svc_list_str="${installed_svcs[*]}"
+        case "$INIT_SYSTEM" in
+            systemd)
+                log_info "  查看状态:  systemctl status <${svc_list_str// /|}>"
+                log_info "  重启服务:  systemctl restart <服务名>"
+                log_info "  查看日志:  journalctl -u <服务名> -f"
+                ;;
+            sysvinit)
+                log_info "  查看状态:  /etc/init.d/<服务名> status"
+                log_info "  重启服务:  /etc/init.d/<服务名> restart"
+                log_info "  查看日志:  tail -f /var/log/<服务名>.log"
+                ;;
+            openrc)
+                log_info "  查看状态:  rc-service <服务名> status"
+                log_info "  重启服务:  rc-service <服务名> restart"
+                ;;
+            *)
+                log_info "  当前无 init 系统, 请手动管理进程"
+                ;;
+        esac
+    fi
     echo ""
 }
 
@@ -1414,17 +1539,232 @@ _print_svc_status() {
 }
 
 # ============================================================================
+#                          卸载功能
+# ============================================================================
+
+do_uninstall() {
+    # ---------- Banner ----------
+    echo ""
+    echo -e "${CYAN}${BOLD}"
+    echo "  ╔══════════════════════════════════════════════╗"
+    echo "  ║       多服务一键卸载脚本                      ║"
+    echo "  ║  Cloudflared · Lucky · 3x-ui                ║"
+    echo "  ╚══════════════════════════════════════════════╝"
+    echo -e "${NC}"
+
+    log_info "Init 系统: ${INIT_SYSTEM}"
+
+    # ---------- 检测已安装的服务 ----------
+    local cf_found=false lucky_found=false xui_found=false
+    _is_installed cloudflared /usr/local/bin/cloudflared && cf_found=true
+    _is_installed lucky /usr/local/bin/lucky             && lucky_found=true
+    _is_installed x-ui /usr/local/x-ui/x-ui             && xui_found=true
+
+    if ! $cf_found && ! $lucky_found && ! $xui_found; then
+        echo ""
+        log_warn "未检测到任何已安装的服务, 无需卸载"
+        echo ""
+        return 0
+    fi
+
+    # ---------- 选择要卸载的服务 ----------
+    local cf_tag="" lucky_tag="" xui_tag=""
+    $cf_found   && cf_tag="  ${GREEN}[已安装]${NC}"   || cf_tag="  ${RED}[未安装]${NC}"
+    $lucky_found && lucky_tag="  ${GREEN}[已安装]${NC}" || lucky_tag="  ${RED}[未安装]${NC}"
+    $xui_found  && xui_tag="  ${GREEN}[已安装]${NC}"  || xui_tag="  ${RED}[未安装]${NC}"
+
+    echo ""
+    echo -e "${CYAN}${BOLD}请选择要卸载的服务 (直接回车 = 全部卸载):${NC}"
+    echo ""
+    echo -e "  ${GREEN}1${NC}) Cloudflared Tunnel   — Cloudflare 内网穿透隧道${cf_tag}"
+    echo -e "  ${GREEN}2${NC}) Lucky (幸运加速)      — DDNS / 端口转发 / 反向代理${lucky_tag}"
+    echo -e "  ${GREEN}3${NC}) 3x-ui (X-UI 面板)    — 多协议代理面板${xui_tag}"
+    echo ""
+    echo -e "  输入编号, 多选逗号分隔 (如 ${BOLD}1,3${NC}), 或直接回车全卸"
+    echo ""
+    read -rp "$(echo -e "${BLUE}[选择]${NC} ")" choice
+
+    local do_cf=false do_lucky=false do_xui=false
+
+    if [[ -z "$choice" ]]; then
+        # 回车 = 卸载所有已安装的
+        $cf_found   && do_cf=true
+        $lucky_found && do_lucky=true
+        $xui_found  && do_xui=true
+    else
+        choice="${choice// /,}"
+        IFS=',' read -ra items <<< "$choice"
+        for item in "${items[@]}"; do
+            case "$item" in
+                1) $cf_found    && do_cf=true    || log_warn "Cloudflared 未安装, 跳过" ;;
+                2) $lucky_found && do_lucky=true || log_warn "Lucky 未安装, 跳过" ;;
+                3) $xui_found  && do_xui=true   || log_warn "3x-ui 未安装, 跳过" ;;
+                *) log_warn "忽略未知选项: $item" ;;
+            esac
+        done
+    fi
+
+    if ! $do_cf && ! $do_lucky && ! $do_xui; then
+        log_info "未选择任何服务, 取消卸载"
+        return 0
+    fi
+
+    # ---------- 显示将要卸载的服务 ----------
+    echo ""
+    log_info "将卸载以下服务:"
+    $do_cf    && echo -e "  ${RED}✗${NC} Cloudflared Tunnel"
+    $do_lucky && echo -e "  ${RED}✗${NC} Lucky (幸运加速)"
+    $do_xui   && echo -e "  ${RED}✗${NC} 3x-ui (X-UI 面板)"
+    echo ""
+    read -rp "$(echo -e "${RED}[确认]${NC} 输入 YES 继续卸载: ")" confirm
+    if [[ "$confirm" != "YES" ]]; then
+        log_info "已取消"
+        return 0
+    fi
+
+    # ---------- 统一停止/禁用 (复用已有函数) ----------
+    _uninstall_stop() {
+        local name="$1"
+        svc_stop "$name" 2>/dev/null || true
+        pkill -f "$name" 2>/dev/null || true
+        case "$INIT_SYSTEM" in
+            systemd)  systemctl disable "$name" 2>/dev/null || true ;;
+            sysvinit)
+                command -v update-rc.d &>/dev/null && update-rc.d -f "$name" remove 2>/dev/null || true
+                command -v chkconfig &>/dev/null && chkconfig --del "$name" 2>/dev/null || true
+                ;;
+            openrc)   rc-update del "$name" 2>/dev/null || true ;;
+        esac
+    }
+
+    # ============================================================================
+    #  1. Cloudflared
+    # ============================================================================
+    if $do_cf; then
+        log_step "卸载 Cloudflared"
+
+        _uninstall_stop cloudflared
+
+        # cloudflared 自带卸载命令
+        if command -v cloudflared &>/dev/null; then
+            log_info "执行 cloudflared service uninstall..."
+            cloudflared service uninstall 2>/dev/null || true
+        fi
+
+        # 清理文件
+        rm -f /usr/local/bin/cloudflared
+        rm -f /usr/bin/cloudflared
+        rm -f /etc/init.d/cloudflared
+        rm -f /etc/systemd/system/cloudflared.service
+        rm -f /lib/systemd/system/cloudflared.service
+        rm -rf /etc/cloudflared
+        rm -f /var/run/cloudflared.pid
+        rm -rf "${CONF_DIR}/cloudflared.conf"
+
+        log_success "Cloudflared 已清除"
+    fi
+
+    # ============================================================================
+    #  2. Lucky
+    # ============================================================================
+    if $do_lucky; then
+        log_step "卸载 Lucky"
+
+        _uninstall_stop lucky
+
+        # Lucky 官方卸载脚本
+        if [[ -x /usr/share/lucky.daji/scripts/luckyservice ]]; then
+            log_info "执行 Lucky 自带卸载..."
+            /usr/share/lucky.daji/scripts/luckyservice uninstall 2>/dev/null || true
+        fi
+
+        # 清理所有可能的安装路径
+        rm -rf /usr/share/lucky.daji
+        rm -rf /usr/share/lucky
+        rm -rf /etc/lucky
+        rm -rf /etc/lucky.daji
+        rm -f /usr/local/bin/lucky
+        rm -f /etc/init.d/lucky
+        rm -f /etc/systemd/system/lucky.service
+        rm -f /lib/systemd/system/lucky.service
+        rm -f /var/run/lucky.pid
+        rm -rf /var/log/lucky
+
+        # 清理 profile 中可能的 PATH 注入
+        sed -i '/lucky/d' /etc/profile 2>/dev/null || true
+
+        log_success "Lucky 已清除"
+    fi
+
+    # ============================================================================
+    #  3. 3x-ui
+    # ============================================================================
+    if $do_xui; then
+        log_step "卸载 3x-ui"
+
+        _uninstall_stop x-ui
+
+        # 3x-ui 自带卸载
+        if [[ -f /usr/local/x-ui/x-ui.sh ]]; then
+            log_info "执行 3x-ui 自带卸载..."
+            echo "y" | /usr/local/x-ui/x-ui.sh uninstall 2>/dev/null || true
+        fi
+
+        # 清理文件
+        rm -rf /usr/local/x-ui
+        rm -rf /etc/x-ui
+        rm -f /etc/init.d/x-ui
+        rm -f /etc/systemd/system/x-ui.service
+        rm -f /lib/systemd/system/x-ui.service
+        rm -f /var/run/x-ui.pid
+
+        # 清理 fail2ban (3x-ui 安装的)
+        if command -v fail2ban-client &>/dev/null; then
+            log_info "清理 fail2ban 配置..."
+            fail2ban-client stop 2>/dev/null || true
+            rm -rf /etc/fail2ban/jail.d/x-ui* 2>/dev/null || true
+            rm -rf /etc/fail2ban/jail.d/3x-ui* 2>/dev/null || true
+        fi
+
+        log_success "3x-ui 已清除"
+    fi
+
+    # ============================================================================
+    #  4. 公共清理
+    # ============================================================================
+    log_step "清理残留"
+
+    # 空的配置目录
+    rmdir "${CONF_DIR}" 2>/dev/null || true
+
+    # systemd 重载
+    if [[ "$INIT_SYSTEM" == "systemd" ]]; then
+        systemctl daemon-reload 2>/dev/null || true
+    fi
+
+    # 刷新 PATH 缓存
+    hash -r 2>/dev/null || true
+
+    # ---------- 卸载总览 ----------
+    echo ""
+    divider
+    log_info "${BOLD}卸载完成, 已清理:${NC}"
+    $do_cf    && echo -e "  ${GREEN}✓${NC} Cloudflared Tunnel"
+    $do_lucky && echo -e "  ${GREEN}✓${NC} Lucky (幸运加速)"
+    $do_xui   && echo -e "  ${GREEN}✓${NC} 3x-ui (X-UI 面板)"
+    divider
+    echo ""
+    log_success "${BOLD}全部选定服务已彻底卸载!${NC}"
+    echo -e "  ${CYAN}重新安装请运行:${NC} bash setup.sh"
+    echo ""
+}
+
+# ============================================================================
 #                          主流程
 # ============================================================================
 
 main() {
-    echo ""
-    echo -e "${CYAN}${BOLD}"
-    echo "  ╔══════════════════════════════════════════════╗"
-    echo "  ║       多服务一键部署脚本  v${SCRIPT_VERSION}           ║"
-    echo "  ║  Cloudflared · Lucky · 3x-ui                ║"
-    echo "  ╚══════════════════════════════════════════════╝"
-    echo -e "${NC}"
+    show_banner
 
     check_root
     interactive_prompt
@@ -1433,29 +1773,60 @@ main() {
     check_network
     install_dependencies
 
-    # 根据用户选择安装服务
+    local total_start=$SECONDS
+
+    # 根据用户选择安装服务, 每个服务计时
     if $INSTALL_CF; then
+        local t0=$SECONDS
         install_cloudflared
+        local elapsed=$(( SECONDS - t0 ))
+        log_info "Cloudflared 安装耗时 ${elapsed} 秒"
     else
-        log_info "跳过 Cloudflared (未选择)"
+        echo -e "  ${NC}跳过 Cloudflared (未选择)${NC}"
     fi
 
     if $INSTALL_LUCKY; then
+        local t0=$SECONDS
         install_lucky
+        local elapsed=$(( SECONDS - t0 ))
+        log_info "Lucky 安装耗时 ${elapsed} 秒"
     else
-        log_info "跳过 Lucky (未选择)"
+        echo -e "  ${NC}跳过 Lucky (未选择)${NC}"
     fi
 
     if $INSTALL_3XUI; then
+        local t0=$SECONDS
         install_3xui
+        local elapsed=$(( SECONDS - t0 ))
+        log_info "3x-ui 安装耗时 ${elapsed} 秒"
     else
-        log_info "跳过 3x-ui (未选择)"
+        echo -e "  ${NC}跳过 3x-ui (未选择)${NC}"
     fi
 
     show_status
 
-    log_success "${BOLD}全部服务部署完成!${NC}"
+    local total_elapsed=$(( SECONDS - total_start ))
+    log_success "${BOLD}全部服务部署完成! (总耗时 ${total_elapsed} 秒)${NC}"
     echo ""
 }
 
-main "$@"
+# ============================================================================
+#                          入口分发 (所有函数已定义)
+# ============================================================================
+
+case "${1:-}" in
+    --uninstall|-u)
+        check_root
+        detect_os_silent
+        do_uninstall
+        ;;
+    --status|-s)
+        check_root
+        detect_os_silent
+        show_banner
+        show_status
+        ;;
+    *)
+        main "$@"
+        ;;
+esac

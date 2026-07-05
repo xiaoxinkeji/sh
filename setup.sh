@@ -13,13 +13,20 @@
 set -uo pipefail
 
 # ========================== 全局变量 ==========================
-SCRIPT_VERSION="3.2.1"
+SCRIPT_VERSION="3.3.0"
 CLOUDFLARED_TOKEN=""
 INSTALL_CF=true
 INSTALL_LUCKY=true
 INSTALL_3XUI=true
 CONF_DIR="/etc/services-deploy"
 TMP_FILES=()
+
+# ---------- --uninstall 快捷入口 ----------
+if [[ "${1:-}" == "--uninstall" || "${1:-}" == "-u" ]]; then
+    echo -e "${YELLOW}正在下载卸载脚本...${NC}"
+    bash <(curl -fsSL https://raw.githubusercontent.com/xiaoxinkeji/sh/main/uninstall.sh)
+    exit $?
+fi
 
 # 颜色
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
@@ -186,6 +193,42 @@ check_root() {
     fi
 }
 
+# ---------- 自动从已安装的 cloudflared 提取 Token ----------
+_auto_extract_cf_token() {
+    local token=""
+
+    # 1) 我们之前存的配置文件
+    if [[ -f "${CONF_DIR}/cloudflared.conf" ]]; then
+        token="$(grep -oP 'CLOUDFLARED_TOKEN=\K.*' "${CONF_DIR}/cloudflared.conf" 2>/dev/null)"
+    fi
+
+    # 2) cloudflared 自身的 service 配置 (systemd 会生成)
+    if [[ -z "$token" ]] && [[ -f /etc/systemd/system/cloudflared.service ]]; then
+        token="$(grep -oP -- '--token\s+\K\S+' /etc/systemd/system/cloudflared.service 2>/dev/null)"
+    fi
+
+    # 3) init.d 脚本中
+    if [[ -z "$token" ]] && [[ -f /etc/init.d/cloudflared ]]; then
+        token="$(grep -oP -- '--token\s+\K\S+' /etc/init.d/cloudflared 2>/dev/null)"
+        # 也可能是从 conf 文件 source 的
+        if [[ -z "$token" ]] && grep -q 'cloudflared.conf' /etc/init.d/cloudflared 2>/dev/null; then
+            token="$(grep -oP 'CLOUDFLARED_TOKEN=\K.*' "${CONF_DIR}/cloudflared.conf" 2>/dev/null)"
+        fi
+    fi
+
+    # 4) cloudflared 内部配置目录
+    if [[ -z "$token" ]] && [[ -d /etc/cloudflared ]]; then
+        token="$(grep -rhoP '"token":\s*"\K[^"]+' /etc/cloudflared/ 2>/dev/null | head -1)"
+    fi
+
+    if [[ -n "$token" ]]; then
+        CLOUDFLARED_TOKEN="$token"
+        log_success "已自动提取 Cloudflared Token (${#token} 字符)"
+        return 0
+    fi
+    return 1
+}
+
 # ---------- 交互式: 选择服务 + 输入 Token ----------
 interactive_prompt() {
     echo ""
@@ -225,18 +268,37 @@ interactive_prompt() {
     $INSTALL_3XUI  && log_success "  3x-ui (X-UI 面板)"
     echo ""
 
-    # 如果选了 Cloudflared, 提示输入 Token
+    # 如果选了 Cloudflared, 先尝试自动提取 Token
     if $INSTALL_CF; then
-        echo -e "${CYAN}请输入 Cloudflared Tunnel Token:${NC}"
-        echo -e "(获取方式: Cloudflare Zero Trust Dashboard → Networks → Tunnels → 复制 token)"
-        echo ""
-        read -rp "$(echo -e "${BLUE}[Token]${NC} ")" CLOUDFLARED_TOKEN
-
-        if [[ -z "$CLOUDFLARED_TOKEN" ]]; then
-            log_warn "未输入 Token, 将跳过 Cloudflared 安装"
-            INSTALL_CF=false
+        if _auto_extract_cf_token; then
+            echo ""
+            read -rp "$(echo -e "${BLUE}[确认]${NC} 使用此 Token? (Y/n/输入新Token): ")" token_choice
+            case "$token_choice" in
+                ""|[Yy]*)
+                    # 使用已提取的 token
+                    ;;
+                [Nn]*)
+                    INSTALL_CF=false
+                    log_warn "已跳过 Cloudflared"
+                    ;;
+                *)
+                    # 用户输入了新 token
+                    CLOUDFLARED_TOKEN="$token_choice"
+                    log_success "Token 已更新 (${#CLOUDFLARED_TOKEN} 字符)"
+                    ;;
+            esac
         else
-            log_success "Token 已接收 (${#CLOUDFLARED_TOKEN} 字符)"
+            echo -e "${CYAN}请输入 Cloudflared Tunnel Token:${NC}"
+            echo -e "(获取方式: Cloudflare Zero Trust Dashboard → Networks → Tunnels → 复制 token)"
+            echo ""
+            read -rp "$(echo -e "${BLUE}[Token]${NC} ")" CLOUDFLARED_TOKEN
+
+            if [[ -z "$CLOUDFLARED_TOKEN" ]]; then
+                log_warn "未输入 Token, 将跳过 Cloudflared 安装"
+                INSTALL_CF=false
+            else
+                log_success "Token 已接收 (${#CLOUDFLARED_TOKEN} 字符)"
+            fi
         fi
     fi
 

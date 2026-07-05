@@ -1473,10 +1473,10 @@ show_status() {
         divider
         log_info "${BOLD}3x-ui 面板信息${NC}"
         local xui_user xui_pass xui_port xui_path xui_ip
-        xui_user="$(grep -oP '^XUI_USER=\K.*' /etc/x-ui/install-result.env 2>/dev/null)"
-        xui_pass="$(grep -oP '^XUI_PASS=\K.*' /etc/x-ui/install-result.env 2>/dev/null)"
-        xui_port="$(grep -oP '^XUI_PORT=\K.*' /etc/x-ui/install-result.env 2>/dev/null)"
-        xui_path="$(grep -oP '^XUI_BASE_PATH=\K.*' /etc/x-ui/install-result.env 2>/dev/null)"
+        xui_user="$(grep -oP '^XUI_USERNAME=\K.*' /etc/x-ui/install-result.env 2>/dev/null)"
+        xui_pass="$(grep -oP '^XUI_PASSWORD=\K.*' /etc/x-ui/install-result.env 2>/dev/null)"
+        xui_port="$(grep -oP '^XUI_PANEL_PORT=\K.*' /etc/x-ui/install-result.env 2>/dev/null)"
+        xui_path="$(grep -oP '^XUI_WEB_BASE_PATH=\K.*' /etc/x-ui/install-result.env 2>/dev/null)"
         xui_ip="$(curl -s --max-time 3 ifconfig.me 2>/dev/null || hostname -I | awk '{print $1}')"
         if [[ -n "$xui_port" ]]; then
             has_access_info=true

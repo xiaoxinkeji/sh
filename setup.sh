@@ -199,9 +199,8 @@ _systemd_works() {
 
 check_root() {
     if [[ $EUID -ne 0 ]]; then
-        log_error "此脚本需要 root 权限运行"
-        echo "请使用: sudo bash $0"
-        exit 1
+        log_warn "需要 root 权限, 自动切换 sudo..."
+        exec sudo bash "$0" "$@"
     fi
 }
 

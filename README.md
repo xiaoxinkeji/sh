@@ -1,6 +1,14 @@
 # 多服务一键部署脚本
 
-一键部署 Cloudflared Tunnel、Lucky (幸运加速)、3x-ui (X-UI 面板) 三大服务。
+一键部署 Cloudflared Tunnel、Lucky (幸运加速)、3x-ui (X-UI 面板)。
+
+## 一行安装
+
+```bash
+bash <(curl -fsSL https://raw.githubusercontent.com/xiaoxinkeji/sh/main/setup.sh)
+```
+
+脚本会自动请求 root 权限，启动后进入交互式菜单选择要安装的服务。
 
 ## 兼容性
 
@@ -11,19 +19,21 @@
 | 架构 | amd64 / arm64 / arm / 386 |
 | 包管理器 | apt / dnf / yum / pacman / zypper / apk / opkg |
 
-## 快速开始
+## 交互流程
 
-```bash
-curl -fsSLO https://raw.githubusercontent.com/xiaoxinkeji/sh/main/setup.sh
-sudo bash setup.sh
+```
+请选择要安装的服务 (直接回车 = 全部安装):
+
+  1) Cloudflared Tunnel   — Cloudflare 内网穿透隧道
+  2) Lucky (幸运加速)      — DDNS / 端口转发 / 反向代理
+  3) 3x-ui (X-UI 面板)    — 多协议代理面板
+
+  输入编号, 多选逗号分隔 (如 1,3), 或直接回车全选
+
+[选择] _
 ```
 
-脚本启动后会进入交互式菜单:
-
-1. 选择要安装的服务 (支持多选, 直接回车全选)
-2. 如果选择了 Cloudflared, 按提示粘贴 Token
-
-Token 获取: [Cloudflare Zero Trust Dashboard](https://one.dash.cloudflare.com/) → Networks → Tunnels → 复制 token
+选择 Cloudflared 时会提示粘贴 Token (从 [Cloudflare Zero Trust Dashboard](https://one.dash.cloudflare.com/) → Networks → Tunnels 获取)。未输入则自动跳过。
 
 ## 集成的服务
 
@@ -45,22 +55,26 @@ Token 获取: [Cloudflare Zero Trust Dashboard](https://one.dash.cloudflare.com/
 
 **精确进程检测:** 使用二进制路径精确匹配，避免 `pgrep -f` 误杀同名进程。
 
-## 管理命令
+## 安装后管理
+
+安装完成后，根据系统 init 类型使用对应命令:
 
 ```bash
-# systemd
-systemctl status cloudflared
-systemctl restart lucky
-journalctl -u x-ui -f
+# ── systemd (Ubuntu/Debian/CentOS/Fedora/Arch 等主流发行版) ──
+systemctl status cloudflared lucky x-ui     # 查看状态
+systemctl restart cloudflared               # 重启单个服务
+journalctl -u lucky -f                      # 查看实时日志
 
-# sysvinit
-/etc/init.d/cloudflared status
-/etc/init.d/lucky restart
+# ── sysvinit (精简系统 / 老系统) ──
+/etc/init.d/cloudflared status              # 查看状态
+/etc/init.d/lucky restart                   # 重启服务
 
-# OpenRC
-rc-service cloudflared status
-rc-service lucky restart
+# ── OpenRC (Alpine / Gentoo) ──
+rc-service cloudflared status               # 查看状态
+rc-service lucky restart                    # 重启服务
 ```
+
+安装日志保存在 `/var/log/setup-services.log`。
 
 ## License
 

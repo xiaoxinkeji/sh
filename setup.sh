@@ -13,7 +13,7 @@
 set -uo pipefail
 
 # ========================== 全局变量 ==========================
-SCRIPT_VERSION="3.1.0"
+SCRIPT_VERSION="3.2.0"
 CLOUDFLARED_TOKEN=""
 INSTALL_CF=true
 INSTALL_LUCKY=true
@@ -801,35 +801,34 @@ EOF
 install_lucky() {
     log_step "2/3  安装 Lucky (幸运加速)"
 
-    # ---------- 已安装检测 ----------
-    if command -v lucky &>/dev/null || [[ -f /usr/local/bin/lucky ]]; then
-        log_info "Lucky 已安装, 跳过安装步骤"
-        if svc_status lucky /usr/local/bin/lucky; then
-            log_success "Lucky 服务已在运行"
-            return 0
-        fi
-        svc_restart lucky
-        return 0
+    # ---------- 尝试定位已有的二进制 (含官方脚本装到非标准路径的情况) ----------
+    if ! command -v lucky &>/dev/null && [[ ! -f /usr/local/bin/lucky ]]; then
+        _link_lucky_binary 2>/dev/null || true
     fi
 
-    log_info "正在下载并安装 Lucky..."
+    # ---------- 如果仍然没有, 执行安装 ----------
+    if ! command -v lucky &>/dev/null && [[ ! -f /usr/local/bin/lucky ]]; then
+        log_info "正在下载并安装 Lucky..."
 
-    # ---------- 官方脚本安装 ----------
-    local LUCKY_URL="http://release.66666.host"
-    local INSTALL_SCRIPT="/tmp/lucky_install_$$.sh"
-    TMP_FILES+=("$INSTALL_SCRIPT")
+        local LUCKY_URL="http://release.66666.host"
+        local INSTALL_SCRIPT="/tmp/lucky_install_$$.sh"
+        TMP_FILES+=("$INSTALL_SCRIPT")
 
-    if download_retry "${LUCKY_URL}/install.sh" "$INSTALL_SCRIPT"; then
-        chmod +x "$INSTALL_SCRIPT"
-        if sh "$INSTALL_SCRIPT" "$LUCKY_URL" 2>&1; then
-            log_success "Lucky 安装成功 (官方脚本)"
+        if download_retry "${LUCKY_URL}/install.sh" "$INSTALL_SCRIPT"; then
+            chmod +x "$INSTALL_SCRIPT"
+            if sh "$INSTALL_SCRIPT" "$LUCKY_URL" 2>&1; then
+                log_success "Lucky 安装成功 (官方脚本)"
+                _link_lucky_binary
+            else
+                log_warn "官方脚本安装失败, 尝试备用方案..."
+                _install_lucky_manual
+            fi
         else
-            log_warn "官方脚本安装失败, 尝试备用方案..."
+            log_warn "无法下载 Lucky 官方安装脚本, 尝试备用方案..."
             _install_lucky_manual
         fi
     else
-        log_warn "无法下载 Lucky 官方安装脚本, 尝试备用方案..."
-        _install_lucky_manual
+        log_info "Lucky 已安装, 跳过下载"
     fi
 
     # ---------- 确保有对应的服务注册 ----------
@@ -866,6 +865,42 @@ _install_lucky_manual() {
     mkdir -p /etc/lucky /var/log/lucky
 
     log_success "Lucky 二进制安装完成"
+}
+
+# 官方安装脚本可能把 lucky 装到各种位置, 统一查找并建软链接到 /usr/local/bin/lucky
+_link_lucky_binary() {
+    # 如果已经在标准位置, 不用处理
+    [[ -x /usr/local/bin/lucky ]] && return 0
+
+    local search_paths=(
+        /usr/share/lucky.daji/lucky
+        /usr/share/lucky/lucky
+        /etc/lucky/lucky
+        /usr/local/lucky/lucky
+        /opt/lucky/lucky
+    )
+
+    local found=""
+    for p in "${search_paths[@]}"; do
+        if [[ -x "$p" ]]; then
+            found="$p"
+            break
+        fi
+    done
+
+    # 还没找到, 全盘搜一下
+    if [[ -z "$found" ]]; then
+        found="$(find /usr /etc /opt -name "lucky" -type f -executable 2>/dev/null | head -1)"
+    fi
+
+    if [[ -n "$found" ]]; then
+        log_info "发现 Lucky 二进制: $found"
+        ln -sf "$found" /usr/local/bin/lucky
+        log_success "已创建软链接: /usr/local/bin/lucky → $found"
+    else
+        log_warn "未找到 Lucky 二进制文件"
+        return 1
+    fi
 }
 
 _ensure_lucky_service() {
@@ -934,6 +969,8 @@ install_3xui() {
     # ---------- 已安装检测 ----------
     if [[ -f /usr/local/x-ui/x-ui ]]; then
         log_info "3x-ui 已安装"
+        # 先确保服务脚本存在 (官方脚本可能只创建了 systemd unit)
+        _ensure_3xui_service
         if svc_status x-ui /usr/local/x-ui/x-ui; then
             log_success "3x-ui 服务已在运行"
             return 0

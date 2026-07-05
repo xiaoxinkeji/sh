@@ -13,7 +13,7 @@
 set -uo pipefail
 
 # ========================== 全局变量 ==========================
-SCRIPT_VERSION="3.5.0"
+SCRIPT_VERSION="3.5.1"
 CLOUDFLARED_TOKEN=""
 INSTALL_CF=true
 INSTALL_LUCKY=true
@@ -501,10 +501,11 @@ svc_status() {
 }
 
 # ---------- 直接启动 (绕过 init.d, 用于降级兜底) ----------
-# 用法: _direct_start <服务名> <二进制路径> [启动参数...]
+# 用法: _direct_start <服务名> <二进制路径> <工作目录|-> [启动参数...]
+#   工作目录传 "-" 表示不切换目录
 _direct_start() {
-    local name="$1" bin="$2"
-    shift 2
+    local name="$1" bin="$2" workdir="$3"
+    shift 3
     local args=("$@")
     local pidfile="/var/run/${name}.pid"
     local logfile="/var/log/${name}.log"
@@ -514,17 +515,35 @@ _direct_start() {
     sleep 1
 
     log_info "尝试直接启动 ${name} (nohup 模式)..."
-    nohup "$bin" "${args[@]}" >> "$logfile" 2>&1 &
-    local pid=$!
-    echo "$pid" > "$pidfile"
+
+    if [[ "$workdir" != "-" && -d "$workdir" ]]; then
+        # 需要指定工作目录 (3x-ui 等依赖相对路径的程序)
+        (cd "$workdir" && nohup "$bin" "${args[@]}" >> "$logfile" 2>&1 &)
+        sleep 1
+        # 子 shell 里拿不到 PID, 用 pgrep 补
+        pgrep -x "$(basename "$bin")" | head -1 > "$pidfile" 2>/dev/null
+    else
+        nohup "$bin" "${args[@]}" >> "$logfile" 2>&1 &
+        local pid=$!
+        echo "$pid" > "$pidfile"
+    fi
 
     sleep 3
-    if kill -0 "$pid" 2>/dev/null; then
+    # 检查进程是否存活
+    local pid
+    pid="$(cat "$pidfile" 2>/dev/null)"
+    if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
         log_success "${name} 直接启动成功 (PID: ${pid})"
         return 0
     fi
+    # 也试试 pgrep 兜底
+    if pgrep -x "$(basename "$bin")" &>/dev/null; then
+        pgrep -x "$(basename "$bin")" | head -1 > "$pidfile"
+        log_success "${name} 直接启动成功 (PID: $(cat "$pidfile"))"
+        return 0
+    fi
 
-    log_error "${name} 直接启动也失败了 (PID $pid 已退出)"
+    log_error "${name} 直接启动也失败了"
     if [[ -s "$logfile" ]]; then
         tail -5 "$logfile" 2>/dev/null | while IFS= read -r line; do echo "    $line"; done
     fi
@@ -557,11 +576,18 @@ _add_to_rc_local() {
 #                  通用 init.d 脚本生成 (跨发行版)
 # ============================================================================
 
-# 用法: _gen_initd_script <服务名> <描述> <可执行文件路径> <启动参数> <PID文件>
+# 用法: _gen_initd_script <服务名> <描述> <可执行文件路径> <启动参数> <PID文件> [工作目录]
 # 始终使用 nohup + shell 重定向, 最可靠, 日志一定能写入
 _gen_initd_script() {
     local name="$1" desc="$2" bin="$3" args="$4" pidfile="$5"
+    local workdir="${6:-}"
     local script="/etc/init.d/${name}"
+
+    # 如果有工作目录, 在启动前 cd 过去
+    local cd_prefix=""
+    if [[ -n "$workdir" ]]; then
+        cd_prefix="cd ${workdir} && "
+    fi
 
     cat > "$script" << INITD_EOF
 #!/bin/sh
@@ -580,6 +606,7 @@ DAEMON_ARGS="${args}"
 PIDFILE="${pidfile}"
 LOGFILE="/var/log/\${NAME}.log"
 DESC="${desc}"
+WORKDIR="${workdir}"
 
 _is_running() {
     if [ -f "\$PIDFILE" ]; then
@@ -606,6 +633,9 @@ do_start() {
     echo "Starting \$DESC: \$NAME"
 
     # 直接后台运行, stdout+stderr 都写入日志
+    if [ -n "\$WORKDIR" ] && [ -d "\$WORKDIR" ]; then
+        cd "\$WORKDIR" || exit 1
+    fi
     nohup "\$DAEMON" \$DAEMON_ARGS >> "\$LOGFILE" 2>&1 &
     local pid=\$!
     echo \$pid > "\$PIDFILE"
@@ -808,7 +838,7 @@ install_cloudflared() {
     if (( start_rc != 0 )); then
         # init.d 失败, 降级: 直接用 nohup 启动
         log_warn "init.d 启动失败, 尝试直接启动..."
-        _direct_start cloudflared /usr/local/bin/cloudflared \
+        _direct_start cloudflared /usr/local/bin/cloudflared - \
             tunnel --no-autoupdate run --token "$CLOUDFLARED_TOKEN"
     else
         # init.d 启动成功, 再做一轮快速确认
@@ -1052,7 +1082,7 @@ install_lucky() {
 
     if (( start_rc != 0 )); then
         log_warn "init.d 启动失败, 尝试直接启动..."
-        _direct_start lucky /usr/local/bin/lucky -cd /etc/lucky
+        _direct_start lucky /usr/local/bin/lucky - -cd /etc/lucky
     else
         sleep 2
         if svc_status lucky /usr/local/bin/lucky; then
@@ -1201,7 +1231,7 @@ install_3xui() {
             svc_start x-ui || start_rc=$?
         fi
         if (( start_rc != 0 )); then
-            _direct_start x-ui /usr/local/x-ui/x-ui
+            _direct_start x-ui /usr/local/x-ui/x-ui /usr/local/x-ui
         elif svc_status x-ui /usr/local/x-ui/x-ui; then
             log_success "3x-ui 服务已启动"
         else
@@ -1245,7 +1275,7 @@ install_3xui() {
 
     if (( start_rc != 0 )); then
         log_warn "init.d 启动失败, 尝试直接启动..."
-        _direct_start x-ui /usr/local/x-ui/x-ui
+        _direct_start x-ui /usr/local/x-ui/x-ui /usr/local/x-ui
     else
         sleep 3
         if svc_status x-ui /usr/local/x-ui/x-ui; then
@@ -1286,7 +1316,8 @@ EOF
                     "3x-ui Panel" \
                     "/usr/local/x-ui/x-ui" \
                     "" \
-                    "/var/run/x-ui.pid"
+                    "/var/run/x-ui.pid" \
+                    "/usr/local/x-ui"
                 log_info "已生成 /etc/init.d/x-ui"
             fi
             ;;

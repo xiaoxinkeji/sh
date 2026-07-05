@@ -21,16 +21,16 @@ INSTALL_3XUI=true
 CONF_DIR="/etc/services-deploy"
 TMP_FILES=()
 
+# 颜色
+RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
+BLUE='\033[0;34m'; CYAN='\033[0;36m'; BOLD='\033[1m'; NC='\033[0m'
+
 # ---------- --uninstall 快捷入口 ----------
 if [[ "${1:-}" == "--uninstall" || "${1:-}" == "-u" ]]; then
     echo -e "${YELLOW}正在下载卸载脚本...${NC}"
     bash <(curl -fsSL https://raw.githubusercontent.com/xiaoxinkeji/sh/main/uninstall.sh)
     exit $?
 fi
-
-# 颜色
-RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
-BLUE='\033[0;34m'; CYAN='\033[0;36m'; BOLD='\033[1m'; NC='\033[0m'
 
 # ============================================================================
 #                          基础设施

@@ -13,11 +13,17 @@ bash <(curl -fsSL https://raw.githubusercontent.com/xiaoxinkeji/sh/main/setup.sh
 ## 其他用法
 
 ```bash
-# 查看服务状态
+# 查看服务状态 (含版本号、凭据、访问地址)
 bash setup.sh --status
+
+# 修复未运行的服务 (自动检测并重启)
+bash setup.sh --repair
 
 # 卸载服务 (交互式选择)
 bash setup.sh --uninstall
+
+# 查看帮助
+bash setup.sh --help
 ```
 
 ## 兼容性
@@ -55,11 +61,17 @@ bash setup.sh --uninstall
 
 ## 脚本特性
 
-**一体化:** 安装、卸载、状态查看全部集成在一个脚本中。`--uninstall` 不再需要下载远程脚本，`--status` 快速查看运行状态。
+**一体化:** 安装、卸载、状态查看、修复全部集成在一个脚本中。支持 `--status`、`--repair`、`--uninstall`、`--help` 四种非安装模式。
 
 **环境自适应:** 自动检测操作系统、架构、包管理器和 init 系统。精简系统 (Alpine / OpenWrt) 也能正常运行。
 
 **Init 三层降级:** systemd → OpenRC → sysvinit → 无 init。无 systemd 时自动生成 `/etc/init.d/` 脚本，启动失败时自动降级为 nohup 直接启动。
+
+**颜色自适应:** 自动检测 TTY 环境，管道或重定向输出时自动关闭颜色，避免乱码。
+
+**修复模式:** `--repair` 自动检测未运行的服务并尝试重启，支持 init 启动失败后降级 nohup 兜底。
+
+**状态总览增强:** `--status` 显示各服务版本号、3x-ui 面板凭据和访问地址、Cloudflare Tunnel 隧道地址、Lucky 管理页面地址，未运行的服务显示最近 3 条错误日志。
 
 **安全:** Cloudflared Token 存入独立配置文件 (权限 600)，不硬编码到 init.d 脚本中。
 

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ============================================================================
-#  多服务一键部署脚本  v4.0.0
+#  多服务一键部署脚本  v4.1.0
 #  集成: Cloudflared Tunnel / Lucky(幸运加速) / 3x-ui (X-UI)
 #
 #  Init 支持: systemd / sysvinit / OpenRC
@@ -11,22 +11,31 @@
 #    sudo bash setup.sh              # 安装模式
 #    sudo bash setup.sh --status     # 查看服务状态
 #    sudo bash setup.sh --uninstall  # 卸载服务
+#    sudo bash setup.sh --repair     # 修复未运行的服务
+#    sudo bash setup.sh --help       # 显示帮助
 # ============================================================================
 
 set -uo pipefail
 
 # ========================== 全局变量 ==========================
-SCRIPT_VERSION="4.0.0"
+SCRIPT_VERSION="4.1.0"
 CLOUDFLARED_TOKEN=""
 INSTALL_CF=true
 INSTALL_LUCKY=true
 INSTALL_3XUI=true
 CONF_DIR="/etc/services-deploy"
 TMP_FILES=()
+PUBLIC_IP=""          # 缓存公网 IP, 避免重复请求
+USE_COLOR=true        # 颜色输出开关 (非 TTY 时自动关闭)
 
-# 颜色
-RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
-BLUE='\033[0;34m'; CYAN='\033[0;36m'; BOLD='\033[1m'; NC='\033[0m'
+# 颜色 (非 TTY 时自动置空, 避免管道/重定向输出带乱码)
+if [[ -t 1 ]]; then
+    RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
+    BLUE='\033[0;34m'; CYAN='\033[0;36m'; BOLD='\033[1m'; NC='\033[0m'
+else
+    RED=''; GREEN=''; YELLOW=''; BLUE=''; CYAN=''; BOLD=''; NC=''
+    USE_COLOR=false
+fi
 
 # ============================================================================
 #                          基础设施
@@ -47,6 +56,42 @@ log_warn()    { echo -e "${YELLOW}[WARN]${NC}  $*"; }
 log_error()   { echo -e "${RED}[FAIL]${NC} $*"; }
 log_step()    { echo -e "\n${CYAN}${BOLD}━━━ $* ━━━${NC}"; }
 divider()     { echo -e "${BLUE}──────────────────────────────────────────────────────${NC}"; }
+
+# ---------- 获取公网 IP (带缓存) ----------
+get_public_ip() {
+    if [[ -n "$PUBLIC_IP" ]]; then
+        echo "$PUBLIC_IP"
+        return
+    fi
+    PUBLIC_IP="$(curl -s --max-time 5 ifconfig.me 2>/dev/null)"
+    if [[ -z "$PUBLIC_IP" ]]; then
+        PUBLIC_IP="$(curl -s --max-time 5 icanhazip.com 2>/dev/null)"
+    fi
+    if [[ -z "$PUBLIC_IP" ]]; then
+        PUBLIC_IP="$(hostname -I 2>/dev/null | awk '{print $1}')"
+    fi
+    echo "$PUBLIC_IP"
+}
+
+# ---------- 获取服务版本号 ----------
+_get_cf_version() {
+    command -v cloudflared &>/dev/null && cloudflared --version 2>&1 | grep -oP 'cloudflared version \K\S+' | head -1
+}
+
+_get_lucky_version() {
+    if [[ -x /usr/local/bin/lucky ]]; then
+        /usr/local/bin/lucky -v 2>&1 | grep -oP 'v\K[0-9.]+' | head -1 || \
+        /usr/local/bin/lucky --version 2>&1 | grep -oP 'v\K[0-9.]+' | head -1
+    fi
+}
+
+_get_xui_version() {
+    if [[ -f /usr/local/x-ui/version ]]; then
+        cat /usr/local/x-ui/version 2>/dev/null | grep -oP 'v\K[0-9.]+' | head -1
+    elif [[ -f /usr/local/x-ui/x-ui ]]; then
+        /usr/local/x-ui/x-ui -v 2>&1 | grep -oP 'v\K[0-9.]+' | head -1
+    fi
+}
 
 # ---------- 带重试的下载 ----------
 # 用法: download_retry <url> <output> [max_retries]
@@ -107,7 +152,15 @@ check_disk_space() {
 #                          环境检测
 # ============================================================================
 
-detect_os() {
+# 检测 systemd 是否真正可用 (排除容器假阳性)
+_systemd_works() {
+    [[ -d /run/systemd/system ]] && return 0
+    command -v systemctl &>/dev/null && systemctl is-system-running &>/dev/null 2>&1 && return 0
+    return 1
+}
+
+# 核心检测逻辑 (detect_os 和 detect_os_silent 共用)
+_detect_os_core() {
     OS=""; OS_ID=""; OS_VER=""; ARCH=""; PKG_MGR=""; INIT_SYSTEM=""
 
     # ---------- 操作系统 ----------
@@ -135,7 +188,7 @@ detect_os() {
         aarch64|arm64)      ARCH="arm64" ;;
         armv7l|armhf|armv7) ARCH="arm"   ;;
         i386|i686)          ARCH="386"   ;;
-        *)                  ARCH="$raw_arch"; log_warn "未识别架构 $raw_arch, 保持原值" ;;
+        *)                  ARCH="$raw_arch" ;;
     esac
 
     # ---------- 包管理器 ----------
@@ -146,10 +199,7 @@ detect_os() {
     elif command -v zypper   &>/dev/null; then PKG_MGR="zypper"
     elif command -v apk      &>/dev/null; then PKG_MGR="apk"
     elif command -v opkg     &>/dev/null; then PKG_MGR="opkg"
-    else
-        log_warn "未检测到已知包管理器, 跳过依赖安装"
-        PKG_MGR="none"
-    fi
+    else PKG_MGR="none"; fi
 
     # ---------- Init 系统 ----------
     if _systemd_works; then
@@ -160,8 +210,12 @@ detect_os() {
         INIT_SYSTEM="sysvinit"
     else
         INIT_SYSTEM="none"
-        log_warn "未检测到任何 init 系统, 仅安装二进制, 不注册自启"
     fi
+}
+
+# 完整版 detect_os (带输出, 用于安装流程)
+detect_os() {
+    _detect_os_core
 
     echo ""
     divider
@@ -175,62 +229,15 @@ detect_os() {
     divider
 }
 
-# 检测 systemd 是否真正可用 (排除容器假阳性)
-_systemd_works() {
-    [[ -d /run/systemd/system ]] && return 0
-    command -v systemctl &>/dev/null && systemctl is-system-running &>/dev/null 2>&1 && return 0
-    return 1
+# 静默版 detect_os (不打印输出, 用于 --uninstall / --status / --repair 入口)
+detect_os_silent() {
+    _detect_os_core
 }
 
 check_root() {
     if [[ $EUID -ne 0 ]]; then
         log_warn "需要 root 权限, 自动切换 sudo..."
         exec sudo bash "$0" "$@"
-    fi
-}
-
-# 静默版 detect_os, 不打印输出 (用于 --uninstall / --status 入口)
-detect_os_silent() {
-    OS=""; OS_ID=""; OS_VER=""; ARCH=""; PKG_MGR=""; INIT_SYSTEM=""
-    if [[ -f /etc/os-release ]]; then
-        . /etc/os-release
-        OS="${NAME:-Unknown}"; OS_ID="${ID:-unknown}"; OS_VER="${VERSION_ID:-}"
-    elif [[ -f /etc/redhat-release ]]; then
-        OS="RedHat"; OS_ID="rhel"
-    elif [[ -f /etc/debian_version ]]; then
-        OS="Debian"; OS_ID="debian"; OS_VER="$(cat /etc/debian_version)"
-    elif [[ -f /etc/alpine-release ]]; then
-        OS="Alpine Linux"; OS_ID="alpine"; OS_VER="$(cat /etc/alpine-release)"
-    elif [[ -f /etc/openwrt_release ]]; then
-        OS="OpenWrt"; OS_ID="openwrt"
-    else
-        OS="$(uname -s)"; OS_ID="unknown"
-    fi
-    local raw_arch
-    raw_arch="$(uname -m)"
-    case "$raw_arch" in
-        x86_64)             ARCH="amd64" ;;
-        aarch64|arm64)      ARCH="arm64" ;;
-        armv7l|armhf|armv7) ARCH="arm"   ;;
-        i386|i686)          ARCH="386"   ;;
-        *)                  ARCH="$raw_arch" ;;
-    esac
-    if   command -v apt-get  &>/dev/null; then PKG_MGR="apt"
-    elif command -v dnf      &>/dev/null; then PKG_MGR="dnf"
-    elif command -v yum      &>/dev/null; then PKG_MGR="yum"
-    elif command -v pacman   &>/dev/null; then PKG_MGR="pacman"
-    elif command -v zypper   &>/dev/null; then PKG_MGR="zypper"
-    elif command -v apk      &>/dev/null; then PKG_MGR="apk"
-    elif command -v opkg     &>/dev/null; then PKG_MGR="opkg"
-    else PKG_MGR="none"; fi
-    if _systemd_works; then
-        INIT_SYSTEM="systemd"
-    elif command -v rc-service &>/dev/null && [[ -d /etc/init.d ]]; then
-        INIT_SYSTEM="openrc"
-    elif [[ -d /etc/init.d ]] || command -v service &>/dev/null; then
-        INIT_SYSTEM="sysvinit"
-    else
-        INIT_SYSTEM="none"
     fi
 }
 
@@ -252,8 +259,32 @@ show_banner() {
     echo "  ╔══════════════════════════════════════════════╗"
     echo "  ║${lpad}${title}${rpad}║"
     echo "  ║  Cloudflared · Lucky · 3x-ui                ║"
-    echo "  ╚══════════════════════════════════════════════╝"
+    echo "  ══════════════════════════════════════════════╝"
     echo -e "${NC}"
+}
+
+# ---------- 显示帮助 ----------
+show_help() {
+    echo ""
+    echo -e "${CYAN}${BOLD}多服务一键部署脚本  v${SCRIPT_VERSION}${NC}"
+    echo ""
+    echo -e "${BOLD}用法:${NC}"
+    echo "  sudo bash setup.sh              安装模式 (交互式选择服务)"
+    echo "  sudo bash setup.sh --status     查看已安装服务的运行状态"
+    echo "  sudo bash setup.sh --repair     修复未运行的服务 (自动重启)"
+    echo "  sudo bash setup.sh --uninstall  卸载服务 (交互式选择)"
+    echo "  sudo bash setup.sh --help       显示此帮助信息"
+    echo ""
+    echo -e "${BOLD}集成服务:${NC}"
+    echo "  Cloudflared Tunnel   Cloudflare 内网穿透隧道"
+    echo "  Lucky (幸运加速)     DDNS / 端口转发 / 反向代理"
+    echo "  3x-ui (X-UI 面板)   多协议代理面板"
+    echo ""
+    echo -e "${BOLD}支持环境:${NC}"
+    echo "  Init:    systemd / sysvinit / OpenRC (自动检测降级)"
+    echo "  发行版:  Ubuntu Debian CentOS RHEL Fedora Arch Alpine OpenWrt openSUSE"
+    echo "  架构:    amd64 / arm64 / arm / 386"
+    echo ""
 }
 
 # ---------- 自动从已安装的 cloudflared 提取 Token ----------
@@ -665,12 +696,6 @@ _gen_initd_script() {
     local name="$1" desc="$2" bin="$3" args="$4" pidfile="$5"
     local workdir="${6:-}"
     local script="/etc/init.d/${name}"
-
-    # 如果有工作目录, 在启动前 cd 过去
-    local cd_prefix=""
-    if [[ -n "$workdir" ]]; then
-        cd_prefix="cd ${workdir} && "
-    fi
 
     cat > "$script" << INITD_EOF
 #!/bin/sh
@@ -1454,6 +1479,17 @@ EOF
 #                          服务状态总览
 # ============================================================================
 
+# 从 install-result.env 读取字段 (处理 printf '%q' 的 shell 转义)
+_read_env_field() {
+    local file="$1" key="$2"
+    local val
+    val="$(grep -oP "^${key}=\K.*" "$file" 2>/dev/null)"
+    # 去掉 printf '%q' 可能添加的引号
+    val="${val#\'}"; val="${val%\'}"
+    val="${val#\"}"; val="${val%\"}"
+    echo "$val"
+}
+
 show_status() {
     echo ""
     divider
@@ -1465,44 +1501,53 @@ show_status() {
     _print_svc_status "3x-ui (X-UI 面板)"  "x-ui"        "/usr/local/x-ui/x-ui"
 
     # ---------- 显示访问信息 ----------
-    local has_access_info=false
+    local public_ip
+    public_ip="$(get_public_ip)"
 
     # 3x-ui 凭据
     if _is_installed x-ui /usr/local/x-ui/x-ui && [[ -f /etc/x-ui/install-result.env ]]; then
         echo ""
         divider
         log_info "${BOLD}3x-ui 面板信息${NC}"
-        local xui_user xui_pass xui_port xui_path xui_ip
-        xui_user="$(grep -oP '^XUI_USERNAME=\K.*' /etc/x-ui/install-result.env 2>/dev/null)"
-        xui_pass="$(grep -oP '^XUI_PASSWORD=\K.*' /etc/x-ui/install-result.env 2>/dev/null)"
-        xui_port="$(grep -oP '^XUI_PANEL_PORT=\K.*' /etc/x-ui/install-result.env 2>/dev/null)"
-        xui_path="$(grep -oP '^XUI_WEB_BASE_PATH=\K.*' /etc/x-ui/install-result.env 2>/dev/null)"
-        xui_ip="$(curl -s --max-time 3 ifconfig.me 2>/dev/null || hostname -I | awk '{print $1}')"
+        local xui_user xui_pass xui_port xui_path
+        xui_user="$(_read_env_field /etc/x-ui/install-result.env XUI_USERNAME)"
+        xui_pass="$(_read_env_field /etc/x-ui/install-result.env XUI_PASSWORD)"
+        xui_port="$(_read_env_field /etc/x-ui/install-result.env XUI_PANEL_PORT)"
+        xui_path="$(_read_env_field /etc/x-ui/install-result.env XUI_WEB_BASE_PATH)"
         if [[ -n "$xui_port" ]]; then
-            has_access_info=true
-            echo -e "  ${CYAN}访问地址:${NC}  http://${xui_ip}:${xui_port}/${xui_path}"
+            echo -e "  ${CYAN}访问地址:${NC}  http://${public_ip}:${xui_port}/${xui_path}"
             echo -e "  ${CYAN}用户名:${NC}    ${BOLD}${xui_user}${NC}"
             echo -e "  ${CYAN}密码:${NC}      ${BOLD}${xui_pass}${NC}"
             echo -e "  ${YELLOW}⚠ 请妥善保存以上凭据!${NC}"
         fi
     fi
 
+    # Cloudflare Tunnel URL (如果 Cloudflared 在运行)
+    if _is_installed cloudflared /usr/local/bin/cloudflared && svc_status cloudflared /usr/local/bin/cloudflared; then
+        local tunnel_url=""
+        # 尝试从 quick tunnels 日志中提取 URL
+        if [[ -f /var/log/cloudflared.log ]]; then
+            tunnel_url="$(grep -oP 'https://[a-z0-9-]+\.trycloudflare\.com' /var/log/cloudflared.log 2>/dev/null | tail -1)"
+        fi
+        if [[ -n "$tunnel_url" ]]; then
+            echo ""
+            divider
+            log_info "${BOLD}Cloudflare Tunnel${NC}"
+            echo -e "  ${CYAN}隧道地址:${NC}  ${BOLD}${tunnel_url}${NC}"
+        fi
+    fi
+
     # Lucky 管理页面
     if _is_installed lucky /usr/local/bin/lucky; then
         local lucky_port=""
-        # Lucky 默认端口 16601
         if [[ -f /etc/lucky/lucky.conf ]]; then
             lucky_port="$(grep -oP '"port"\s*:\s*\K[0-9]+' /etc/lucky/lucky.conf 2>/dev/null)"
         fi
         lucky_port="${lucky_port:-16601}"
-        if [[ -z "$has_access_info" ]] || true; then
-            echo ""
-            divider
-            log_info "${BOLD}Lucky 管理页面${NC}"
-            local lucky_ip
-            lucky_ip="$(curl -s --max-time 3 ifconfig.me 2>/dev/null || hostname -I | awk '{print $1}')"
-            echo -e "  ${CYAN}访问地址:${NC}  http://${lucky_ip}:${lucky_port}"
-        fi
+        echo ""
+        divider
+        log_info "${BOLD}Lucky 管理页面${NC}"
+        echo -e "  ${CYAN}访问地址:${NC}  http://${public_ip}:${lucky_port}"
     fi
 
     # ---------- 管理命令 (只显示已安装服务的) ----------
@@ -1542,31 +1587,135 @@ show_status() {
 _print_svc_status() {
     local display="$1" svc_name="$2" bin_path="$3"
     local installed=false
+    local version=""
 
     # 文件存在 OR 在 PATH 中能找到, 都算已安装
     if [[ -x "$bin_path" ]] || command -v "$svc_name" &>/dev/null; then
         installed=true
     fi
 
-    printf "  %-22s : " "$display"
+    # 获取版本号
+    if $installed; then
+        case "$svc_name" in
+            cloudflared) version="$(_get_cf_version)" ;;
+            lucky)       version="$(_get_lucky_version)" ;;
+            x-ui)        version="$(_get_xui_version)" ;;
+        esac
+    fi
+
+    # 格式化输出 (带版本号)
+    if [[ -n "$version" ]]; then
+        printf "  %-22s : " "$display"
+    else
+        printf "  %-22s : " "$display"
+    fi
+
     if $installed; then
         if svc_status "$svc_name" "$bin_path"; then
-            echo -e "${GREEN}● 运行中${NC}"
+            if [[ -n "$version" ]]; then
+                echo -e "${GREEN}● 运行中${NC}  ${BOLD}${version}${NC}"
+            else
+                echo -e "${GREEN}● 运行中${NC}"
+            fi
         else
-            echo -e "${YELLOW}● 已安装 (未运行)${NC}"
-            # 尝试显示最近日志错误, 帮助排查
+            if [[ -n "$version" ]]; then
+                echo -e "${YELLOW}● 已安装 (未运行)${NC}  ${version}"
+            else
+                echo -e "${YELLOW}● 已安装 (未运行)${NC}"
+            fi
+            # 尝试显示最近日志错误, 帮助排查 (显示最近 3 条)
             local logfile="/var/log/${svc_name}.log"
             if [[ -f "$logfile" ]]; then
-                local last_err
-                last_err="$(grep -i 'error\|fail\|fatal\|panic' "$logfile" 2>/dev/null | tail -1)"
-                if [[ -n "$last_err" ]]; then
-                    echo -e "    ${RED}└ 最近错误: ${last_err:0:80}${NC}"
+                local err_lines
+                err_lines="$(grep -i 'error\|fail\|fatal\|panic' "$logfile" 2>/dev/null | tail -3)"
+                if [[ -n "$err_lines" ]]; then
+                    echo -e "    ${RED}└ 最近错误:${NC}"
+                    echo "$err_lines" | while IFS= read -r line; do
+                        echo -e "      ${RED}${line:0:90}${NC}"
+                    done
                 fi
             fi
         fi
     else
         echo -e "${RED}● 未安装${NC}"
     fi
+}
+
+# ============================================================================
+#                          修复模式
+# ============================================================================
+
+do_repair() {
+    echo ""
+    echo -e "${CYAN}${BOLD}"
+    echo "  ╔══════════════════════════════════════════════╗"
+    echo "         服务修复模式                            ║"
+    echo "  ║  检测并重启未运行的服务                       ║"
+    echo "  ╚══════════════════════════════════════════════╝"
+    echo -e "${NC}"
+
+    log_info "Init 系统: ${INIT_SYSTEM}"
+    echo ""
+
+    local repaired=0 skipped=0 not_installed=0
+
+    # 检查并修复每个服务
+    _repair_svc() {
+        local display="$1" svc_name="$2" bin_path="$3"
+        shift 3
+        local start_args=("$@")
+
+        if ! _is_installed "$svc_name" "$bin_path"; then
+            echo -e "  ${YELLOW}○${NC} ${display} — 未安装, 跳过"
+            (( not_installed++ ))
+            return
+        fi
+
+        if svc_status "$svc_name" "$bin_path"; then
+            echo -e "  ${GREEN}●${NC} ${display} — 运行正常"
+            (( skipped++ ))
+            return
+        fi
+
+        echo -e "  ${RED}${NC} ${display} — 未运行, 尝试修复..."
+
+        # 尝试重启
+        svc_stop "$svc_name" 2>/dev/null
+        sleep 1
+
+        local rc=0
+        if [[ "$INIT_SYSTEM" == "sysvinit" || "$INIT_SYSTEM" == "openrc" ]] && [[ -x "/etc/init.d/$svc_name" ]]; then
+            "/etc/init.d/$svc_name" start || rc=$?
+        else
+            svc_start "$svc_name" || rc=$?
+        fi
+
+        if (( rc != 0 )) && (( ${#start_args[@]} > 0 )); then
+            _direct_start "$svc_name" "$bin_path" "${start_args[@]}" || rc=$?
+        fi
+
+        sleep 2
+        if svc_status "$svc_name" "$bin_path"; then
+            echo -e "    ${GREEN}└ 修复成功${NC}"
+            (( repaired++ ))
+        else
+            echo -e "    ${RED}└ 修复失败, 请检查日志: /var/log/${svc_name}.log${NC}"
+        fi
+    }
+
+    _repair_svc "Cloudflared Tunnel" "cloudflared" "/usr/local/bin/cloudflared" \
+        - "tunnel" "--no-autoupdate" "run" "--token" "$CLOUDFLARED_TOKEN"
+    _repair_svc "Lucky (幸运加速)"   "lucky"       "/usr/local/bin/lucky" \
+        - "-cd" "/etc/lucky"
+    _repair_svc "3x-ui (X-UI 面板)"  "x-ui"        "/usr/local/x-ui/x-ui" \
+        "/usr/local/x-ui"
+
+    # 修复总览
+    echo ""
+    divider
+    log_info "修复结果: ${GREEN}${repaired} 个已修复${NC} / ${YELLOW}${skipped} 个正常${NC} / ${RED}${not_installed} 个未安装${NC}"
+    divider
+    echo ""
 }
 
 # ============================================================================
@@ -1643,7 +1792,7 @@ do_uninstall() {
     # ---------- 显示将要卸载的服务 ----------
     echo ""
     log_info "将卸载以下服务:"
-    $do_cf    && echo -e "  ${RED}✗${NC} Cloudflared Tunnel"
+    $do_cf    && echo -e "  ${RED}${NC} Cloudflared Tunnel"
     $do_lucky && echo -e "  ${RED}✗${NC} Lucky (幸运加速)"
     $do_xui   && echo -e "  ${RED}✗${NC} 3x-ui (X-UI 面板)"
     echo ""
@@ -1846,6 +1995,9 @@ main() {
 # ============================================================================
 
 case "${1:-}" in
+    --help|-h)
+        show_help
+        ;;
     --uninstall|-u)
         check_root
         detect_os_silent
@@ -1856,6 +2008,13 @@ case "${1:-}" in
         detect_os_silent
         show_banner
         show_status
+        ;;
+    --repair|-r)
+        check_root
+        detect_os_silent
+        # repair 模式需要 cloudflared token (如果有的话)
+        _auto_extract_cf_token 2>/dev/null || true
+        do_repair
         ;;
     *)
         main "$@"

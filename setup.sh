@@ -585,9 +585,17 @@ _direct_start() {
     local pidfile="/var/run/${name}.pid"
     local logfile="/var/log/${name}.log"
 
-    # 清理残留
-    pkill -x "$name" 2>/dev/null
-    sleep 1
+    # 只清理 PID 文件里记录的旧进程, 不用 pkill 杀所有同名进程
+    if [[ -f "$pidfile" ]]; then
+        local old_pid
+        old_pid="$(cat "$pidfile" 2>/dev/null)"
+        if [[ -n "$old_pid" ]] && kill -0 "$old_pid" 2>/dev/null; then
+            kill "$old_pid" 2>/dev/null
+            sleep 1
+            kill -9 "$old_pid" 2>/dev/null
+        fi
+        rm -f "$pidfile"
+    fi
 
     log_info "尝试直接启动 ${name} (nohup 模式)..."
 
@@ -701,9 +709,21 @@ do_start() {
         return 0
     fi
 
-    # 清理可能残留的同名进程
-    pkill -x "\$NAME" 2>/dev/null
-    sleep 1
+    # 只清理 PID 文件里记录的旧进程, 不用 pkill 杀所有同名进程
+    # (pkill 会中断正在进行的数据库写入, 导致 3x-ui 改密码等操作丢失)
+    if [ -f "\$PIDFILE" ]; then
+        local old_pid
+        old_pid=\$(cat "\$PIDFILE" 2>/dev/null)
+        if [ -n "\$old_pid" ] && kill -0 "\$old_pid" 2>/dev/null; then
+            kill "\$old_pid" 2>/dev/null
+            local i=0
+            while [ \$i -lt 5 ] && kill -0 "\$old_pid" 2>/dev/null; do
+                sleep 1; i=\$((i+1))
+            done
+            kill -9 "\$old_pid" 2>/dev/null
+        fi
+        rm -f "\$PIDFILE"
+    fi
 
     echo "Starting \$DESC: \$NAME"
 
@@ -980,9 +1000,20 @@ do_start() {
         return 0
     fi
 
-    # 清理可能残留的同名进程
-    pkill -x "$NAME" 2>/dev/null
-    sleep 1
+    # 只清理 PID 文件里记录的旧进程, 不用 pkill 杀所有同名进程
+    if [ -f "$PIDFILE" ]; then
+        local old_pid
+        old_pid=$(cat "$PIDFILE" 2>/dev/null)
+        if [ -n "$old_pid" ] && kill -0 "$old_pid" 2>/dev/null; then
+            kill "$old_pid" 2>/dev/null
+            local i=0
+            while [ $i -lt 5 ] && kill -0 "$old_pid" 2>/dev/null; do
+                sleep 1; i=$((i+1))
+            done
+            kill -9 "$old_pid" 2>/dev/null
+        fi
+        rm -f "$PIDFILE"
+    fi
 
     echo "Starting $DESC: $NAME"
 

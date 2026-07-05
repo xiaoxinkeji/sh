@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ============================================================================
-#  多服务一键部署脚本  v2.0.0
+#  多服务一键部署脚本  v3.0.0
 #  集成: Cloudflared Tunnel / Lucky(幸运加速) / 3x-ui (X-UI)
 #
 #  Init 支持: systemd / sysvinit / OpenRC
@@ -13,20 +13,106 @@
 set -uo pipefail
 
 # ========================== 全局变量 ==========================
-SCRIPT_VERSION="2.0.0"
+SCRIPT_VERSION="3.0.0"
 CLOUDFLARED_TOKEN="${1:-}"
+LOG_FILE="/var/log/setup-services.log"
+CONF_DIR="/etc/services-deploy"
+TMP_FILES=()
 
 # 颜色
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
 BLUE='\033[0;34m'; CYAN='\033[0;36m'; BOLD='\033[1m'; NC='\033[0m'
 
-# ========================== 日志函数 ==========================
-log_info()    { echo -e "${BLUE}[INFO]${NC}  $*"; }
-log_success() { echo -e "${GREEN}[ OK ]${NC} $*"; }
-log_warn()    { echo -e "${YELLOW}[WARN]${NC}  $*"; }
-log_error()   { echo -e "${RED}[FAIL]${NC} $*"; }
-log_step()    { echo -e "\n${CYAN}${BOLD}━━━ $* ━━━${NC}"; }
+# ============================================================================
+#                          基础设施
+# ============================================================================
+
+# ---------- 信号捕获: 清理临时文件 ----------
+cleanup() {
+    for f in "${TMP_FILES[@]}"; do
+        [[ -f "$f" ]] && rm -f "$f" 2>/dev/null
+    done
+}
+trap cleanup EXIT INT TERM
+
+# ---------- 日志: 同时输出终端和文件 ----------
+_log() {
+    local level="$1"; shift
+    local msg="$*"
+    local ts
+    ts="$(date '+%Y-%m-%d %H:%M:%S')"
+    # 终端带颜色
+    case "$level" in
+        INFO)  echo -e "${BLUE}[INFO]${NC}  $msg" ;;
+        OK)    echo -e "${GREEN}[ OK ]${NC} $msg" ;;
+        WARN)  echo -e "${YELLOW}[WARN]${NC}  $msg" ;;
+        FAIL)  echo -e "${RED}[FAIL]${NC} $msg" ;;
+    esac
+    # 写文件 (纯文本, 无 ANSI)
+    echo "[$ts] [$level] $msg" >> "$LOG_FILE" 2>/dev/null || true
+}
+
+log_info()    { _log INFO  "$*"; }
+log_success() { _log OK    "$*"; }
+log_warn()    { _log WARN  "$*"; }
+log_error()   { _log FAIL  "$*"; }
+log_step()    { echo -e "\n${CYAN}${BOLD}━━━ $* ━━━${NC}"; echo "" >> "$LOG_FILE"; _log INFO "=== $* ==="; }
 divider()     { echo -e "${BLUE}──────────────────────────────────────────────────────${NC}"; }
+
+# ---------- 带重试的下载 ----------
+# 用法: download_retry <url> <output> [max_retries]
+download_retry() {
+    local url="$1" output="$2" retries="${3:-3}"
+    local attempt=1
+    while (( attempt <= retries )); do
+        if curl -fsSL --connect-timeout 15 --max-time 120 -o "$output" "$url" 2>/dev/null; then
+            return 0
+        fi
+        log_warn "下载失败 (第 ${attempt}/${retries} 次): $url"
+        (( attempt++ ))
+        sleep $(( attempt - 1 ))
+    done
+    log_error "下载最终失败: $url"
+    return 1
+}
+
+# ---------- 网络连通性预检 ----------
+check_network() {
+    log_step "网络连通性检查"
+    local targets=("https://github.com" "https://raw.githubusercontent.com" "http://release.66666.host")
+    local ok=0 fail=0
+
+    for target in "${targets[@]}"; do
+        if curl -fsS --connect-timeout 8 --max-time 15 -o /dev/null "$target" 2>/dev/null; then
+            log_success "可达: $target"
+            (( ok++ ))
+        else
+            log_warn "不可达: $target"
+            (( fail++ ))
+        fi
+    done
+
+    if (( fail == ${#targets[@]} )); then
+        log_error "所有目标均不可达, 请检查网络连接"
+        exit 1
+    fi
+    if (( fail > 0 )); then
+        log_warn "${fail} 个目标不可达, 部分服务可能安装失败"
+    fi
+}
+
+# ---------- 磁盘空间检查 (至少需要 500MB) ----------
+check_disk_space() {
+    local required_mb=500
+    local available_mb
+    available_mb="$(df -m / | awk 'NR==2 {print $4}')"
+
+    if [[ -n "$available_mb" ]] && (( available_mb < required_mb )); then
+        log_error "磁盘空间不足: 需要 ${required_mb}MB, 仅有 ${available_mb}MB"
+        exit 1
+    fi
+    log_info "磁盘可用空间: ${available_mb}MB"
+}
 
 # ============================================================================
 #                          环境检测
@@ -56,11 +142,11 @@ detect_os() {
     local raw_arch
     raw_arch="$(uname -m)"
     case "$raw_arch" in
-        x86_64)           ARCH="amd64" ;;
-        aarch64|arm64)    ARCH="arm64" ;;
-        armv7l|armhf|armv7) ARCH="arm" ;;
-        i386|i686)        ARCH="386"   ;;
-        *)                ARCH="$raw_arch"; log_warn "未识别架构 $raw_arch, 保持原值" ;;
+        x86_64)             ARCH="amd64" ;;
+        aarch64|arm64)      ARCH="arm64" ;;
+        armv7l|armhf|armv7) ARCH="arm"   ;;
+        i386|i686)          ARCH="386"   ;;
+        *)                  ARCH="$raw_arch"; log_warn "未识别架构 $raw_arch, 保持原值" ;;
     esac
 
     # ---------- 包管理器 ----------
@@ -72,13 +158,11 @@ detect_os() {
     elif command -v apk      &>/dev/null; then PKG_MGR="apk"
     elif command -v opkg     &>/dev/null; then PKG_MGR="opkg"
     else
-        log_warn "未检测到已知包管理器, 将跳过依赖安装 (请手动确保 curl/wget 可用)"
+        log_warn "未检测到已知包管理器, 跳过依赖安装"
         PKG_MGR="none"
     fi
 
     # ---------- Init 系统 ----------
-    # 优先级: systemd > OpenRC > sysvinit
-    # 注意: 某些容器/WSL 中 systemctl 存在但不可用, 需要实测
     if _systemd_works; then
         INIT_SYSTEM="systemd"
     elif command -v rc-service &>/dev/null && [[ -d /etc/init.d ]]; then
@@ -87,7 +171,7 @@ detect_os() {
         INIT_SYSTEM="sysvinit"
     else
         INIT_SYSTEM="none"
-        log_warn "未检测到任何 init 系统, 服务将仅安装二进制, 不注册自启"
+        log_warn "未检测到任何 init 系统, 仅安装二进制, 不注册自启"
     fi
 
     echo ""
@@ -99,14 +183,13 @@ detect_os() {
     log_info "  包管理器:   ${PKG_MGR}"
     log_info "  Init 系统:  ${BOLD}${INIT_SYSTEM}${NC}"
     log_info "  内核版本:   $(uname -r)"
+    log_info "  日志文件:   ${LOG_FILE}"
     divider
 }
 
 # 检测 systemd 是否真正可用 (排除容器假阳性)
 _systemd_works() {
-    # PID 1 是 systemd 才算数
     [[ -d /run/systemd/system ]] && return 0
-    # 退而检查 systemctl 是否能实际通信
     command -v systemctl &>/dev/null && systemctl is-system-running &>/dev/null 2>&1 && return 0
     return 1
 }
@@ -136,13 +219,6 @@ check_args() {
 
 # ============================================================================
 #                     统一服务管理抽象层
-#  屏蔽 systemd / sysvinit / openrc 差异, 对外暴露统一接口:
-#    svc_enable   <name>          设置开机自启
-#    svc_start    <name>          启动服务
-#    svc_restart  <name>          重启服务
-#    svc_stop     <name>          停止服务
-#    svc_status   <name>          检查是否运行中 (返回 0/1)
-#    svc_daemon_reload            重载配置 (仅 systemd 需要)
 # ============================================================================
 
 svc_daemon_reload() {
@@ -157,7 +233,6 @@ svc_enable() {
             systemctl enable "$name" 2>/dev/null || true
             ;;
         sysvinit)
-            # Debian 系用 update-rc.d, RedHat 系用 chkconfig
             if command -v update-rc.d &>/dev/null; then
                 update-rc.d "$name" defaults 2>/dev/null || true
             elif command -v chkconfig &>/dev/null; then
@@ -166,7 +241,6 @@ svc_enable() {
             elif command -v insserv &>/dev/null; then
                 insserv "$name" 2>/dev/null || true
             else
-                # 最后手段: 写入 rc.local
                 _add_to_rc_local "$name"
             fi
             ;;
@@ -222,34 +296,38 @@ svc_stop() {
 }
 
 # 返回 0 = 运行中, 1 = 未运行
+# 使用精确二进制路径匹配, 避免 pgrep 误判
 svc_status() {
     local name="$1"
+    local bin_path="$2"  # 可选: 传入精确二进制路径
+
     case "$INIT_SYSTEM" in
         systemd)
             systemctl is-active --quiet "$name" 2>/dev/null
             ;;
         sysvinit|openrc)
-            # 优先用 service 命令
             if command -v service &>/dev/null; then
                 service "$name" status &>/dev/null && return 0
             fi
-            # 尝试 init.d 脚本
             if [[ -x "/etc/init.d/$name" ]]; then
                 "/etc/init.d/$name" status &>/dev/null && return 0
             fi
-            # 最终手段: 检查 PID 文件
+            # PID 文件
             if [[ -f "/var/run/${name}.pid" ]]; then
                 local pid
                 pid="$(cat "/var/run/${name}.pid" 2>/dev/null)"
                 [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null && return 0
             fi
-            # pgrep 兜底
-            pgrep -f "$name" &>/dev/null && return 0
+            # 精确路径匹配 (避免 pgrep -f 误匹配)
+            if [[ -n "$bin_path" && -x "$bin_path" ]]; then
+                pgrep -x "$(basename "$bin_path")" &>/dev/null && return 0
+            fi
             return 1
             ;;
         *)
-            # 无 init 系统, 用进程检测
-            pgrep -f "$name" &>/dev/null && return 0
+            if [[ -n "$bin_path" && -x "$bin_path" ]]; then
+                pgrep -x "$(basename "$bin_path")" &>/dev/null && return 0
+            fi
             return 1
             ;;
     esac
@@ -260,28 +338,28 @@ _add_to_rc_local() {
     local name="$1"
     local rc_local="/etc/rc.local"
 
-    # 确保 rc.local 存在
     if [[ ! -f "$rc_local" ]]; then
-        cat > "$rc_local" << 'RCEOF'
-#!/bin/sh
-# rc.local - 开机自启脚本
-exit 0
-RCEOF
+        printf '#!/bin/sh\n# rc.local\nexit 0\n' > "$rc_local"
         chmod +x "$rc_local"
     fi
 
-    # 避免重复添加
     if ! grep -q "/etc/init.d/${name}" "$rc_local" 2>/dev/null; then
-        sed -i "/^exit 0/i /etc/init.d/${name} start" "$rc_local" 2>/dev/null || \
+        # 兼容无 -i 的 sed (虽然 Linux 一般都有 GNU sed)
+        if grep -q "^exit 0" "$rc_local" 2>/dev/null; then
+            sed -i "/^exit 0/i /etc/init.d/${name} start" "$rc_local" 2>/dev/null || \
+                echo "/etc/init.d/${name} start" >> "$rc_local"
+        else
             echo "/etc/init.d/${name} start" >> "$rc_local"
+        fi
     fi
 }
 
 # ============================================================================
-#                     生成 SysVinit 脚本的通用函数
+#                  通用 init.d 脚本生成 (跨发行版)
 # ============================================================================
 
 # 用法: _gen_initd_script <服务名> <描述> <可执行文件路径> <启动参数> <PID文件>
+# 内部自动检测 start-stop-daemon / daemon / nohup 可用哪种
 _gen_initd_script() {
     local name="$1" desc="$2" bin="$3" args="$4" pidfile="$5"
     local script="/etc/init.d/${name}"
@@ -302,63 +380,97 @@ DAEMON="${bin}"
 DAEMON_ARGS="${args}"
 PIDFILE="${pidfile}"
 DESC="${desc}"
-SCRIPTNAME=\$0
 
-# 读取系统函数
+# 读取系统函数库 (兼容 Debian / RedHat)
 if [ -f /lib/lsb/init-functions ]; then
     . /lib/lsb/init-functions
+    LOG_DAEMON_MSG="log_daemon_msg"
 elif [ -f /etc/init.d/functions ]; then
     . /etc/init.d/functions
 fi
 
+# 检测后台运行工具
+if command -v start-stop-daemon >/dev/null 2>&1; then
+    BG_TOOL="ssd"
+elif command -v daemon >/dev/null 2>&1; then
+    BG_TOOL="daemon"
+else
+    BG_TOOL="nohup"
+fi
+
 do_start() {
     if [ -f "\$PIDFILE" ] && kill -0 \$(cat "\$PIDFILE") 2>/dev/null; then
-        echo "\$NAME 已在运行"
+        echo "\$NAME is already running"
         return 1
     fi
-    echo "启动 \$DESC: \$NAME"
-    start-stop-daemon --start --quiet --background --make-pidfile \\
-        --pidfile "\$PIDFILE" --exec "\$DAEMON" -- \$DAEMON_ARGS
+    echo "Starting \$DESC: \$NAME"
+
+    case "\$BG_TOOL" in
+        ssd)
+            start-stop-daemon --start --quiet --background --make-pidfile \\
+                --pidfile "\$PIDFILE" --exec "\$DAEMON" -- \$DAEMON_ARGS
+            ;;
+        daemon)
+            daemon --pidfile="\$PIDFILE" --name="\$NAME" \\
+                "\$DAEMON \$DAEMON_ARGS >> /var/log/\${NAME}.log 2>&1 &"
+            # daemon 可能不写 pidfile, 手动补
+            sleep 1
+            if [ ! -f "\$PIDFILE" ]; then
+                pgrep -x "\$(basename \$DAEMON)" > "\$PIDFILE" 2>/dev/null
+            fi
+            ;;
+        nohup)
+            nohup "\$DAEMON" \$DAEMON_ARGS >> "/var/log/\${NAME}.log" 2>&1 &
+            echo \$! > "\$PIDFILE"
+            ;;
+    esac
     return \$?
 }
 
 do_stop() {
     if [ ! -f "\$PIDFILE" ] || ! kill -0 \$(cat "\$PIDFILE") 2>/dev/null; then
-        echo "\$NAME 未在运行"
+        echo "\$NAME is not running"
+        rm -f "\$PIDFILE"
         return 0
     fi
-    echo "停止 \$DESC: \$NAME"
-    start-stop-daemon --stop --quiet --pidfile "\$PIDFILE" --retry 10
+    echo "Stopping \$DESC: \$NAME"
+    case "\$BG_TOOL" in
+        ssd)
+            start-stop-daemon --stop --quiet --pidfile "\$PIDFILE" --retry 10
+            ;;
+        *)
+            kill \$(cat "\$PIDFILE") 2>/dev/null
+            local i=0
+            while [ \$i -lt 10 ] && kill -0 \$(cat "\$PIDFILE" 2>/dev/null) 2>/dev/null; do
+                sleep 1; i=\$((i+1))
+            done
+            # 强制杀
+            kill -9 \$(cat "\$PIDFILE") 2>/dev/null
+            ;;
+    esac
     rm -f "\$PIDFILE"
     return \$?
 }
 
 do_status() {
     if [ -f "\$PIDFILE" ] && kill -0 \$(cat "\$PIDFILE") 2>/dev/null; then
-        echo "\$NAME 正在运行 (PID: \$(cat \$PIDFILE))"
+        echo "\$NAME is running (PID: \$(cat \$PIDFILE))"
         return 0
     fi
-    echo "\$NAME 未在运行"
+    echo "\$NAME is not running"
     return 1
-}
-
-do_restart() {
-    do_stop
-    sleep 1
-    do_start
 }
 
 case "\$1" in
     start)   do_start   ;;
     stop)    do_stop    ;;
-    restart) do_restart ;;
+    restart) do_stop; sleep 1; do_start ;;
     status)  do_status  ;;
     *)
-        echo "用法: \$0 {start|stop|restart|status}"
+        echo "Usage: \$0 {start|stop|restart|status}"
         exit 1
         ;;
 esac
-
 exit \$?
 INITD_EOF
 
@@ -395,11 +507,9 @@ install_dependencies() {
             zypper --non-quiet install -y curl wget unzip ca-certificates procps > /dev/null 2>&1
             ;;
         apk)
-            # Alpine Linux
             apk add --quiet --no-cache curl wget unzip ca-certificates procps > /dev/null 2>&1
             ;;
         opkg)
-            # OpenWrt
             opkg update >/dev/null 2>&1
             opkg install curl wget unzip ca-certificates procps-ng > /dev/null 2>&1 || \
             opkg install curl wget unzip ca-certificates procps > /dev/null 2>&1
@@ -412,6 +522,16 @@ install_dependencies() {
 # ============================================================================
 #                     1. Cloudflared Tunnel
 # ============================================================================
+
+# 将 token 存入独立配置文件, 权限 600, 不暴露在 init.d 脚本中
+_save_cloudflared_token() {
+    mkdir -p "$CONF_DIR"
+    cat > "${CONF_DIR}/cloudflared.conf" << CEOF
+# Cloudflared Tunnel Token — 由 setup.sh 生成, 请勿泄露
+CLOUDFLARED_TOKEN=${CLOUDFLARED_TOKEN}
+CEOF
+    chmod 600 "${CONF_DIR}/cloudflared.conf"
+}
 
 install_cloudflared() {
     log_step "1/3  安装 Cloudflared"
@@ -433,7 +553,9 @@ install_cloudflared() {
             *)      log_error "不支持的架构: $ARCH"; return 1 ;;
         esac
 
-        curl -fsSL -o /usr/local/bin/cloudflared "$cf_url"
+        if ! download_retry "$cf_url" /usr/local/bin/cloudflared; then
+            log_error "Cloudflared 下载失败"; return 1
+        fi
         chmod +x /usr/local/bin/cloudflared
 
         if cloudflared --version &>/dev/null; then
@@ -442,6 +564,10 @@ install_cloudflared() {
             log_error "Cloudflared 二进制执行失败"; return 1
         fi
     fi
+
+    # ---------- 保存 token 到安全配置文件 ----------
+    _save_cloudflared_token
+    log_info "Token 已存入 ${CONF_DIR}/cloudflared.conf (权限 600)"
 
     # ---------- 注册服务 ----------
     log_info "正在注册 Cloudflared Tunnel 服务..."
@@ -457,12 +583,8 @@ install_cloudflared() {
             fi
             ;;
         sysvinit)
-            # 生成 /etc/init.d/cloudflared 脚本
-            _gen_initd_script "cloudflared" \
-                "Cloudflared Tunnel" \
-                "/usr/local/bin/cloudflared" \
-                "tunnel --no-autoupdate run --token ${CLOUDFLARED_TOKEN}" \
-                "/var/run/cloudflared.pid"
+            # 生成 init.d 脚本, 从配置文件读 token, 不硬编码
+            _gen_cloudflared_sysvinit
             log_success "Cloudflared SysVinit 脚本已生成 (/etc/init.d/cloudflared)"
             ;;
         openrc)
@@ -480,11 +602,119 @@ install_cloudflared() {
     svc_restart cloudflared
     sleep 2
 
-    if svc_status cloudflared; then
+    if svc_status cloudflared /usr/local/bin/cloudflared; then
         log_success "Cloudflared 服务运行正常"
     else
-        log_warn "Cloudflared 服务状态异常, 请检查日志"
+        log_warn "Cloudflared 服务状态异常, 请检查日志: tail -20 $LOG_FILE"
     fi
+}
+
+# SysVinit: init.d 脚本 + 独立 conf 文件存 token
+_gen_cloudflared_sysvinit() {
+    local script="/etc/init.d/cloudflared"
+
+    cat > "$script" << 'INITD_EOF'
+#!/bin/sh
+### BEGIN INIT INFO
+# Provides:          cloudflared
+# Required-Start:    $network $remote_fs $syslog
+# Required-Stop:     $network $remote_fs $syslog
+# Default-Start:     2 3 4 5
+# Default-Stop:      0 1 6
+# Short-Description: Cloudflared Tunnel
+### END INIT INFO
+
+NAME="cloudflared"
+DAEMON="/usr/local/bin/cloudflared"
+PIDFILE="/var/run/cloudflared.pid"
+DESC="Cloudflared Tunnel"
+CONF_FILE="/etc/services-deploy/cloudflared.conf"
+
+# 从配置文件加载 token
+if [ -f "$CONF_FILE" ]; then
+    . "$CONF_FILE"
+else
+    echo "ERROR: Token 配置文件不存在: $CONF_FILE"
+    exit 1
+fi
+
+DAEMON_ARGS="tunnel --no-autoupdate run --token ${CLOUDFLARED_TOKEN}"
+
+# 检测后台运行工具
+if command -v start-stop-daemon >/dev/null 2>&1; then
+    BG_TOOL="ssd"
+elif command -v daemon >/dev/null 2>&1; then
+    BG_TOOL="daemon"
+else
+    BG_TOOL="nohup"
+fi
+
+do_start() {
+    if [ -f "$PIDFILE" ] && kill -0 $(cat "$PIDFILE") 2>/dev/null; then
+        echo "$NAME is already running"
+        return 1
+    fi
+    echo "Starting $DESC: $NAME"
+    case "$BG_TOOL" in
+        ssd)
+            start-stop-daemon --start --quiet --background --make-pidfile \
+                --pidfile "$PIDFILE" --exec "$DAEMON" -- $DAEMON_ARGS
+            ;;
+        daemon)
+            daemon --pidfile="$PIDFILE" --name="$NAME" \
+                "$DAEMON $DAEMON_ARGS >> /var/log/${NAME}.log 2>&1 &"
+            sleep 1
+            [ ! -f "$PIDFILE" ] && pgrep -x "cloudflared" > "$PIDFILE" 2>/dev/null
+            ;;
+        nohup)
+            nohup "$DAEMON" $DAEMON_ARGS >> "/var/log/${NAME}.log" 2>&1 &
+            echo $! > "$PIDFILE"
+            ;;
+    esac
+    return $?
+}
+
+do_stop() {
+    if [ ! -f "$PIDFILE" ] || ! kill -0 $(cat "$PIDFILE") 2>/dev/null; then
+        echo "$NAME is not running"
+        rm -f "$PIDFILE"
+        return 0
+    fi
+    echo "Stopping $DESC: $NAME"
+    case "$BG_TOOL" in
+        ssd)
+            start-stop-daemon --stop --quiet --pidfile "$PIDFILE" --retry 10
+            ;;
+        *)
+            kill $(cat "$PIDFILE") 2>/dev/null
+            local i=0
+            while [ $i -lt 10 ] && kill -0 $(cat "$PIDFILE" 2>/dev/null) 2>/dev/null; do
+                sleep 1; i=$((i+1))
+            done
+            kill -9 $(cat "$PIDFILE") 2>/dev/null
+            ;;
+    esac
+    rm -f "$PIDFILE"
+    return $?
+}
+
+case "$1" in
+    start)   do_start   ;;
+    stop)    do_stop    ;;
+    restart) do_stop; sleep 1; do_start ;;
+    status)
+        if [ -f "$PIDFILE" ] && kill -0 $(cat "$PIDFILE") 2>/dev/null; then
+            echo "$NAME is running (PID: $(cat $PIDFILE))"
+        else
+            echo "$NAME is not running"
+        fi
+        ;;
+    *) echo "Usage: $0 {start|stop|restart|status}"; exit 1 ;;
+esac
+exit $?
+INITD_EOF
+
+    chmod +x "$script"
 }
 
 _gen_cloudflared_systemd() {
@@ -496,7 +726,8 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStart=/usr/local/bin/cloudflared --no-autoupdate tunnel run
+EnvironmentFile=/etc/services-deploy/cloudflared.conf
+ExecStart=/usr/local/bin/cloudflared --no-autoupdate tunnel run --token ${CLOUDFLARED_TOKEN}
 Restart=always
 RestartSec=5
 TimeoutStartSec=0
@@ -513,7 +744,6 @@ _gen_cloudflared_openrc() {
 
 description="Cloudflared Tunnel"
 command="/usr/local/bin/cloudflared"
-command_args="tunnel --no-autoupdate run"
 command_background=true
 pidfile="/var/run/cloudflared.pid"
 retry="SIGTERM 10"
@@ -522,14 +752,19 @@ depend() {
     need net
     after firewall
 }
+
+start_pre() {
+    # 从配置文件加载 token
+    if [ -f /etc/services-deploy/cloudflared.conf ]; then
+        . /etc/services-deploy/cloudflared.conf
+        command_args="tunnel --no-autoupdate run --token ${CLOUDFLARED_TOKEN}"
+    else
+        eerror "Token 配置文件不存在: /etc/services-deploy/cloudflared.conf"
+        return 1
+    fi
+}
 EOF
     chmod +x /etc/init.d/cloudflared
-
-    # OpenRC 需要 conf.d 文件传入 token
-    cat > /etc/conf.d/cloudflared << CEOF
-# Cloudflared Tunnel Token
-command_args="\${command_args} --token ${CLOUDFLARED_TOKEN}"
-CEOF
 }
 
 # ============================================================================
@@ -542,7 +777,7 @@ install_lucky() {
     # ---------- 已安装检测 ----------
     if command -v lucky &>/dev/null || [[ -f /usr/local/bin/lucky ]]; then
         log_info "Lucky 已安装, 跳过安装步骤"
-        if svc_status lucky; then
+        if svc_status lucky /usr/local/bin/lucky; then
             log_success "Lucky 服务已在运行"
             return 0
         fi
@@ -554,9 +789,10 @@ install_lucky() {
 
     # ---------- 官方脚本安装 ----------
     local LUCKY_URL="http://release.66666.host"
-    local INSTALL_SCRIPT="/tmp/lucky_install.sh"
+    local INSTALL_SCRIPT="/tmp/lucky_install_$$.sh"
+    TMP_FILES+=("$INSTALL_SCRIPT")
 
-    if curl -fsSL -o "$INSTALL_SCRIPT" "${LUCKY_URL}/install.sh" 2>/dev/null; then
+    if download_retry "${LUCKY_URL}/install.sh" "$INSTALL_SCRIPT"; then
         chmod +x "$INSTALL_SCRIPT"
         if sh "$INSTALL_SCRIPT" "$LUCKY_URL" 2>&1; then
             log_success "Lucky 安装成功 (官方脚本)"
@@ -564,13 +800,12 @@ install_lucky() {
             log_warn "官方脚本安装失败, 尝试备用方案..."
             _install_lucky_manual
         fi
-        rm -f "$INSTALL_SCRIPT"
     else
         log_warn "无法下载 Lucky 官方安装脚本, 尝试备用方案..."
         _install_lucky_manual
     fi
 
-    # ---------- 非 systemd 系统: 确保有对应的服务脚本 ----------
+    # ---------- 确保有对应的服务注册 ----------
     _ensure_lucky_service
 
     # ---------- 启动 ----------
@@ -579,10 +814,10 @@ install_lucky() {
     svc_restart lucky
     sleep 2
 
-    if svc_status lucky; then
+    if svc_status lucky /usr/local/bin/lucky; then
         log_success "Lucky 服务运行正常"
     else
-        log_warn "Lucky 服务状态异常, 请检查 /etc/init.d/lucky status 或进程"
+        log_warn "Lucky 服务状态异常, 请检查进程"
     fi
 }
 
@@ -597,18 +832,18 @@ _install_lucky_manual() {
         *)     log_error "不支持的架构: $ARCH"; return 1 ;;
     esac
 
-    curl -fsSL -o /usr/local/bin/lucky "$lucky_url"
+    if ! download_retry "$lucky_url" /usr/local/bin/lucky; then
+        log_error "Lucky 下载失败"; return 1
+    fi
     chmod +x /usr/local/bin/lucky
     mkdir -p /etc/lucky /var/log/lucky
 
     log_success "Lucky 二进制安装完成"
 }
 
-# 根据 init 系统确保 Lucky 有对应的服务注册
 _ensure_lucky_service() {
     case "$INIT_SYSTEM" in
         systemd)
-            # 如果官方脚本没有创建 unit, 手动补一个
             if [[ ! -f /etc/systemd/system/lucky.service ]]; then
                 cat > /etc/systemd/system/lucky.service << 'EOF'
 [Unit]
@@ -630,7 +865,6 @@ EOF
             fi
             ;;
         sysvinit)
-            # 如果 /etc/init.d/lucky 不存在, 手动生成
             if [[ ! -f /etc/init.d/lucky ]]; then
                 _gen_initd_script "lucky" \
                     "Lucky Network Tool" \
@@ -673,7 +907,7 @@ install_3xui() {
     # ---------- 已安装检测 ----------
     if [[ -f /usr/local/x-ui/x-ui ]]; then
         log_info "3x-ui 已安装"
-        if svc_status x-ui; then
+        if svc_status x-ui /usr/local/x-ui/x-ui; then
             log_success "3x-ui 服务已在运行"
             return 0
         fi
@@ -684,20 +918,21 @@ install_3xui() {
     log_info "正在下载并安装 3x-ui..."
 
     # ---------- 下载并执行官方安装脚本 ----------
-    local INSTALL_SCRIPT="/tmp/3xui_install.sh"
-    if curl -fsSL -o "$INSTALL_SCRIPT" "https://raw.githubusercontent.com/mhsanaei/3x-ui/master/install.sh" 2>/dev/null; then
+    local INSTALL_SCRIPT="/tmp/3xui_install_$$.sh"
+    TMP_FILES+=("$INSTALL_SCRIPT")
+
+    if download_retry "https://raw.githubusercontent.com/mhsanaei/3x-ui/master/install.sh" "$INSTALL_SCRIPT"; then
         chmod +x "$INSTALL_SCRIPT"
 
         log_info "执行 3x-ui 安装脚本 (自动模式)..."
-        yes | bash "$INSTALL_SCRIPT" 2>&1 || true
-
-        rm -f "$INSTALL_SCRIPT"
+        # 用 here-string 喂入 yes, 避免管道占用 stdin 导致脚本内部 read 异常
+        bash "$INSTALL_SCRIPT" <<< "$(yes | head -20)" 2>&1 || true
     else
         log_error "无法下载 3x-ui 安装脚本, 请检查网络连接"
         return 1
     fi
 
-    # ---------- 非 systemd 系统: 确保有服务脚本 ----------
+    # ---------- 确保有服务脚本 ----------
     _ensure_3xui_service
 
     # ---------- 启动 ----------
@@ -706,7 +941,7 @@ install_3xui() {
     svc_restart x-ui
     sleep 3
 
-    if svc_status x-ui; then
+    if svc_status x-ui /usr/local/x-ui/x-ui; then
         log_success "3x-ui 服务运行正常"
     else
         log_warn "3x-ui 服务状态异常, 请检查日志"
@@ -779,9 +1014,9 @@ show_status() {
     log_info "${BOLD}服务部署状态总览${NC}"
     divider
 
-    _print_svc_status "Cloudflared Tunnel" "cloudflared" "command:cloudflared"
-    _print_svc_status "Lucky (幸运加速)"   "lucky"       "file:/usr/local/bin/lucky"
-    _print_svc_status "3x-ui (X-UI 面板)"  "x-ui"        "file:/usr/local/x-ui/x-ui"
+    _print_svc_status "Cloudflared Tunnel" "cloudflared" "/usr/local/bin/cloudflared"
+    _print_svc_status "Lucky (幸运加速)"   "lucky"       "/usr/local/bin/lucky"
+    _print_svc_status "3x-ui (X-UI 面板)"  "x-ui"        "/usr/local/x-ui/x-ui"
 
     divider
     echo ""
@@ -793,40 +1028,31 @@ show_status() {
             log_info "  查看日志:  journalctl -u <服务名> -f"
             ;;
         sysvinit)
-            log_info "  查看状态:  /etc/init.d/<cloudflared|lucky|x-ui> status"
+            log_info "  查看状态:  /etc/init.d/<服务名> status"
             log_info "  重启服务:  /etc/init.d/<服务名> restart"
             log_info "  查看日志:  tail -f /var/log/<服务名>.log"
             ;;
         openrc)
-            log_info "  查看状态:  rc-service <cloudflared|lucky|x-ui> status"
+            log_info "  查看状态:  rc-service <服务名> status"
             log_info "  重启服务:  rc-service <服务名> restart"
-            log_info "  查看日志:  rc-status / tail -f /var/log/<服务名>.log"
             ;;
         *)
             log_info "  当前无 init 系统, 请手动管理进程"
             ;;
     esac
+    log_info "安装日志:  ${LOG_FILE}"
     echo ""
 }
 
-# 用法: _print_svc_status <显示名> <服务名> <检测方式>
-# 检测方式: command:xxx 或 file:xxx
 _print_svc_status() {
-    local display="$1" svc_name="$2" detect="$3"
+    local display="$1" svc_name="$2" bin_path="$3"
     local installed=false
 
-    case "${detect%%:*}" in
-        command)
-            command -v "${detect#command:}" &>/dev/null && installed=true
-            ;;
-        file)
-            [[ -f "${detect#file:}" ]] && installed=true
-            ;;
-    esac
+    [[ -x "$bin_path" ]] && installed=true
 
     printf "  %-22s : " "$display"
     if $installed; then
-        if svc_status "$svc_name"; then
+        if svc_status "$svc_name" "$bin_path"; then
             echo -e "${GREEN}● 运行中${NC}"
         else
             echo -e "${YELLOW}● 已安装 (未运行)${NC}"
@@ -841,6 +1067,10 @@ _print_svc_status() {
 # ============================================================================
 
 main() {
+    # 初始化日志文件
+    mkdir -p "$(dirname "$LOG_FILE")"
+    echo "===== setup.sh v${SCRIPT_VERSION} started at $(date) =====" >> "$LOG_FILE"
+
     echo ""
     echo -e "${CYAN}${BOLD}"
     echo "  ╔══════════════════════════════════════════════╗"
@@ -852,6 +1082,8 @@ main() {
     check_root
     check_args
     detect_os
+    check_disk_space
+    check_network
     install_dependencies
 
     install_cloudflared
@@ -861,6 +1093,7 @@ main() {
     show_status
 
     log_success "${BOLD}全部服务部署完成!${NC}"
+    log_info "完整日志: ${LOG_FILE}"
     echo ""
 }
 

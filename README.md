@@ -4,13 +4,12 @@
 
 ## 兼容性
 
-**Init 系统:** systemd / sysvinit / OpenRC (自动检测，无 systemd 时自动降级为 sysvinit 或 OpenRC)
-
-**发行版:** Ubuntu / Debian / CentOS / RHEL / Fedora / Arch / Alpine / OpenWrt / openSUSE
-
-**架构:** amd64 / arm64 / arm / 386
-
-**包管理器:** apt / dnf / yum / pacman / zypper / apk / opkg (无包管理器时跳过依赖安装)
+| 维度 | 支持范围 |
+|------|----------|
+| Init 系统 | systemd / sysvinit / OpenRC (自动检测降级) |
+| 发行版 | Ubuntu Debian CentOS RHEL Fedora Arch Alpine OpenWrt openSUSE |
+| 架构 | amd64 / arm64 / arm / 386 |
+| 包管理器 | apt / dnf / yum / pacman / zypper / apk / opkg |
 
 ## 快速开始
 
@@ -32,16 +31,17 @@ Token 获取: [Cloudflare Zero Trust Dashboard](https://one.dash.cloudflare.com/
 
 ## 脚本特性
 
-- 自动检测操作系统、架构、包管理器和 init 系统
-- 统一服务管理抽象层，屏蔽 systemd / sysvinit / OpenRC 差异
-- 无 systemd 时自动生成 `/etc/init.d/` 脚本或 OpenRC 配置
-- 每个服务安装前检查是否已存在，避免重复安装
-- 精简系统 (Alpine / OpenWrt) 也能正常运行
-- 安装完成后展示服务运行状态总览
+**环境自适应:** 自动检测操作系统、架构、包管理器和 init 系统。精简系统 (Alpine / OpenWrt) 也能正常运行。
+
+**Init 三层降级:** systemd → OpenRC → sysvinit → 无 init。无 systemd 时自动生成 `/etc/init.d/` 脚本，init.d 脚本内部还会自动检测 `start-stop-daemon` / `daemon` / `nohup` 哪种可用。
+
+**安全:** Cloudflared Token 存入独立配置文件 (权限 600)，不硬编码到 init.d 脚本中。
+
+**健壮性:** 网络连通性预检、下载重试 (3 次)、磁盘空间检查、文件日志 (`/var/log/setup-services.log`)、信号捕获清理临时文件。
+
+**精确进程检测:** 使用二进制路径精确匹配，避免 `pgrep -f` 误杀同名进程。
 
 ## 管理命令
-
-根据 init 系统不同，管理命令也有区别:
 
 ```bash
 # systemd

@@ -13,7 +13,7 @@
 set -uo pipefail
 
 # ========================== 全局变量 ==========================
-SCRIPT_VERSION="3.4.0"
+SCRIPT_VERSION="3.4.1"
 CLOUDFLARED_TOKEN=""
 INSTALL_CF=true
 INSTALL_LUCKY=true
@@ -424,18 +424,45 @@ svc_status() {
                     return 0
                 fi
             fi
-            # 方法3: pgrep 精确匹配二进制名
+            # 方法3: pgrep 精确匹配二进制名 + 验证 exe 路径
             if [[ -n "$bin_path" && -x "$bin_path" ]]; then
-                if pgrep -x "$(basename "$bin_path")" &>/dev/null; then
-                    return 0
+                local matched_pids
+                matched_pids="$(pgrep -x "$(basename "$bin_path")" 2>/dev/null)"
+                if [[ -n "$matched_pids" ]]; then
+                    while IFS= read -r mpid; do
+                        if [[ -L "/proc/${mpid}/exe" ]]; then
+                            local real_exe
+                            real_exe="$(readlink -f "/proc/${mpid}/exe" 2>/dev/null)"
+                            if [[ "$real_exe" == *"$bin_path"* ]] || [[ "$(basename "$real_exe")" == "$(basename "$bin_path")" ]]; then
+                                return 0
+                            fi
+                        else
+                            # 无法读取 exe (容器限制), 信任 pgrep
+                            return 0
+                        fi
+                    done <<< "$matched_pids"
                 fi
             fi
             return 1
             ;;
         *)
-            # 无 init 系统: 直接查进程
+            # 无 init 系统: 直接查进程 + 验证 exe
             if [[ -n "$bin_path" && -x "$bin_path" ]]; then
-                pgrep -x "$(basename "$bin_path")" &>/dev/null && return 0
+                local matched_pids
+                matched_pids="$(pgrep -x "$(basename "$bin_path")" 2>/dev/null)"
+                if [[ -n "$matched_pids" ]]; then
+                    while IFS= read -r mpid; do
+                        if [[ -L "/proc/${mpid}/exe" ]]; then
+                            local real_exe
+                            real_exe="$(readlink -f "/proc/${mpid}/exe" 2>/dev/null)"
+                            if [[ "$real_exe" == *"$bin_path"* ]] || [[ "$(basename "$real_exe")" == "$(basename "$bin_path")" ]]; then
+                                return 0
+                            fi
+                        else
+                            return 0
+                        fi
+                    done <<< "$matched_pids"
+                fi
             fi
             return 1
             ;;
@@ -721,30 +748,33 @@ install_cloudflared() {
     svc_enable cloudflared
     svc_stop cloudflared 2>/dev/null
     sleep 1
-    svc_start cloudflared
 
-    # 多次验证进程是否真正存活 (避免 init.d 返回 0 但进程立即崩溃的假阳性)
-    local cf_ok=false
-    for i in 1 2 3 4 5; do
+    # 直接调用 init.d 脚本启动 (能看到其输出, 包括错误信息)
+    local start_rc=0
+    if [[ "$INIT_SYSTEM" == "sysvinit" || "$INIT_SYSTEM" == "openrc" ]]; then
+        "/etc/init.d/cloudflared" start || start_rc=$?
+    else
+        svc_start cloudflared || start_rc=$?
+    fi
+
+    if (( start_rc != 0 )); then
+        # init.d 脚本已经输出了错误信息和日志
+        log_error "Cloudflared 启动失败 (init.d 返回码: ${start_rc})"
+        log_warn "请检查: 1) Token 是否正确  2) 网络是否通畅  3) gvisor/容器兼容性"
+    else
+        # 启动成功, 再做一轮快速确认
         sleep 2
         if svc_status cloudflared /usr/local/bin/cloudflared; then
-            cf_ok=true
-            break
+            log_success "Cloudflared 服务运行正常"
+        else
+            log_error "Cloudflared 启动后进程消失"
+            if [[ -f /var/log/cloudflared.log ]]; then
+                log_info "最近日志:"
+                tail -10 /var/log/cloudflared.log 2>/dev/null | while IFS= read -r line; do
+                    echo "    $line"
+                done
+            fi
         fi
-    done
-
-    if $cf_ok; then
-        log_success "Cloudflared 服务运行正常"
-    else
-        log_error "Cloudflared 启动后未能保持运行"
-        # 尝试读取日志输出, 帮助用户排查
-        if [[ -f /var/log/cloudflared.log ]]; then
-            log_info "最近日志 (tail -5 /var/log/cloudflared.log):"
-            tail -5 /var/log/cloudflared.log 2>/dev/null | while IFS= read -r line; do
-                echo "    $line"
-            done
-        fi
-        log_warn "可尝试手动启动排查: /etc/init.d/cloudflared start"
     fi
 }
 
@@ -780,88 +810,91 @@ fi
 
 DAEMON_ARGS="tunnel --no-autoupdate run --token ${CLOUDFLARED_TOKEN}"
 
-# 检测后台运行工具
-if command -v start-stop-daemon >/dev/null 2>&1; then
-    BG_TOOL="ssd"
-elif command -v daemon >/dev/null 2>&1; then
-    BG_TOOL="daemon"
-else
-    BG_TOOL="nohup"
-fi
+# 始终使用直接后台 + shell 重定向, 最可靠且日志一定能写入
+# start-stop-daemon --stdout/--stderr 搭配 --exec 在某些系统上重定向不生效
+
+_is_running() {
+    if [ -f "$PIDFILE" ]; then
+        local pid
+        pid=$(cat "$PIDFILE" 2>/dev/null)
+        if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+            return 0
+        fi
+        rm -f "$PIDFILE"
+    fi
+    return 1
+}
 
 do_start() {
-    if [ -f "$PIDFILE" ] && kill -0 $(cat "$PIDFILE") 2>/dev/null; then
-        echo "$NAME is already running"
-        return 1
+    if _is_running; then
+        echo "$NAME is already running (PID: $(cat $PIDFILE))"
+        return 0
     fi
+
+    # 清理可能残留的同名进程
+    pkill -x "$NAME" 2>/dev/null
+    sleep 1
+
     echo "Starting $DESC: $NAME"
-    case "$BG_TOOL" in
-        ssd)
-            start-stop-daemon --start --quiet --background --make-pidfile \
-                --pidfile "$PIDFILE" --exec "$DAEMON" --stdout "$LOGFILE" --stderr "$LOGFILE" \
-                -- $DAEMON_ARGS
-            ;;
-        daemon)
-            daemon --pidfile="$PIDFILE" --name="$NAME" \
-                "$DAEMON $DAEMON_ARGS >> $LOGFILE 2>&1 &"
-            sleep 1
-            [ ! -f "$PIDFILE" ] && pgrep -x "cloudflared" > "$PIDFILE" 2>/dev/null
-            ;;
-        nohup)
-            nohup "$DAEMON" $DAEMON_ARGS >> "$LOGFILE" 2>&1 &
-            echo $! > "$PIDFILE"
-            ;;
-    esac
+
+    # 直接后台运行, stdout+stderr 都写入日志
+    nohup "$DAEMON" $DAEMON_ARGS >> "$LOGFILE" 2>&1 &
+    local pid=$!
+    echo $pid > "$PIDFILE"
 
     # 启动后验证: 等 3 秒确认进程没有立即崩溃
     sleep 3
-    if [ -f "$PIDFILE" ] && kill -0 $(cat "$PIDFILE") 2>/dev/null; then
+    if kill -0 "$pid" 2>/dev/null; then
         return 0
     fi
-    # 进程已死, 输出最后几行日志帮助排查
-    echo "ERROR: $NAME 启动后退出, 最近日志:"
-    tail -5 "$LOGFILE" 2>/dev/null || echo "(无日志)"
+    # 进程已死, 输出日志帮助排查
+    echo "ERROR: $NAME 启动后退出 (PID $pid 已不存在), 最近日志:"
+    if [ -s "$LOGFILE" ]; then
+        tail -10 "$LOGFILE" 2>/dev/null
+    else
+        echo "(日志文件为空, 进程可能在启动瞬间就退出了)"
+    fi
     rm -f "$PIDFILE"
     return 1
 }
 
 do_stop() {
-    if [ ! -f "$PIDFILE" ] || ! kill -0 $(cat "$PIDFILE") 2>/dev/null; then
+    if ! _is_running; then
         echo "$NAME is not running"
-        rm -f "$PIDFILE"
+        # 兜底: 杀掉所有残留 cloudflared 进程
+        pkill -x "$NAME" 2>/dev/null
         return 0
     fi
     echo "Stopping $DESC: $NAME"
-    case "$BG_TOOL" in
-        ssd)
-            start-stop-daemon --stop --quiet --pidfile "$PIDFILE" --retry 10
-            ;;
-        *)
-            kill $(cat "$PIDFILE") 2>/dev/null
-            local i=0
-            while [ $i -lt 10 ] && kill -0 $(cat "$PIDFILE" 2>/dev/null) 2>/dev/null; do
-                sleep 1; i=$((i+1))
-            done
-            kill -9 $(cat "$PIDFILE") 2>/dev/null
-            ;;
-    esac
+    local pid
+    pid=$(cat "$PIDFILE" 2>/dev/null)
+    kill "$pid" 2>/dev/null
+    local i=0
+    while [ $i -lt 10 ] && kill -0 "$pid" 2>/dev/null; do
+        sleep 1; i=$((i+1))
+    done
+    # 如果还没死, 强制杀
+    if kill -0 "$pid" 2>/dev/null; then
+        kill -9 "$pid" 2>/dev/null
+    fi
     rm -f "$PIDFILE"
-    return $?
+    return 0
+}
+
+do_status() {
+    if _is_running; then
+        echo "$NAME is running (PID: $(cat $PIDFILE))"
+        return 0
+    fi
+    echo "$NAME is not running"
+    return 1
 }
 
 case "$1" in
     start)   do_start   ;;
     stop)    do_stop    ;;
     restart) do_stop; sleep 1; do_start ;;
-    status)
-        if [ -f "$PIDFILE" ] && kill -0 $(cat "$PIDFILE") 2>/dev/null; then
-            echo "$NAME is running (PID: $(cat $PIDFILE))"
-        else
-            echo "$NAME is not running"
-            # 清理残留 pidfile
-            rm -f "$PIDFILE" 2>/dev/null
-        fi
-        ;;
+    status)  do_status  ;;
     *) echo "Usage: $0 {start|stop|restart|status}"; exit 1 ;;
 esac
 exit $?
@@ -965,29 +998,25 @@ install_lucky() {
     svc_enable lucky
     svc_stop lucky 2>/dev/null
     sleep 1
-    svc_start lucky
 
-    # 多次验证进程是否真正存活
-    local lucky_ok=false
-    for i in 1 2 3; do
+    local start_rc=0
+    if [[ "$INIT_SYSTEM" == "sysvinit" || "$INIT_SYSTEM" == "openrc" ]]; then
+        "/etc/init.d/lucky" start || start_rc=$?
+    else
+        svc_start lucky || start_rc=$?
+    fi
+
+    if (( start_rc != 0 )); then
+        log_error "Lucky 启动失败 (返回码: ${start_rc})"
+        [[ -f /var/log/lucky.log ]] && tail -5 /var/log/lucky.log 2>/dev/null | while IFS= read -r line; do echo "    $line"; done
+    else
         sleep 2
         if svc_status lucky /usr/local/bin/lucky; then
-            lucky_ok=true
-            break
+            log_success "Lucky 服务运行正常"
+        else
+            log_error "Lucky 启动后进程消失"
+            [[ -f /var/log/lucky.log ]] && tail -5 /var/log/lucky.log 2>/dev/null | while IFS= read -r line; do echo "    $line"; done
         fi
-    done
-
-    if $lucky_ok; then
-        log_success "Lucky 服务运行正常"
-    else
-        log_error "Lucky 启动后未能保持运行"
-        if [[ -f /var/log/lucky.log ]]; then
-            log_info "最近日志 (tail -5 /var/log/lucky.log):"
-            tail -5 /var/log/lucky.log 2>/dev/null | while IFS= read -r line; do
-                echo "    $line"
-            done
-        fi
-        log_warn "可尝试手动启动排查: /etc/init.d/lucky start"
     fi
 }
 
@@ -1157,29 +1186,25 @@ install_3xui() {
     svc_enable x-ui
     svc_stop x-ui 2>/dev/null
     sleep 1
-    svc_start x-ui
 
-    # 多次验证进程是否真正存活
-    local xui_ok=false
-    for i in 1 2 3; do
-        sleep 2
-        if svc_status x-ui /usr/local/x-ui/x-ui; then
-            xui_ok=true
-            break
-        fi
-    done
-
-    if $xui_ok; then
-        log_success "3x-ui 服务运行正常"
+    local start_rc=0
+    if [[ "$INIT_SYSTEM" == "sysvinit" || "$INIT_SYSTEM" == "openrc" ]]; then
+        "/etc/init.d/x-ui" start || start_rc=$?
     else
-        log_error "3x-ui 启动后未能保持运行"
-        if [[ -f /var/log/x-ui.log ]]; then
-            log_info "最近日志 (tail -5 /var/log/x-ui.log):"
-            tail -5 /var/log/x-ui.log 2>/dev/null | while IFS= read -r line; do
-                echo "    $line"
-            done
+        svc_start x-ui || start_rc=$?
+    fi
+
+    if (( start_rc != 0 )); then
+        log_error "3x-ui 启动失败 (返回码: ${start_rc})"
+        [[ -f /var/log/x-ui.log ]] && tail -5 /var/log/x-ui.log 2>/dev/null | while IFS= read -r line; do echo "    $line"; done
+    else
+        sleep 3
+        if svc_status x-ui /usr/local/x-ui/x-ui; then
+            log_success "3x-ui 服务运行正常"
+        else
+            log_error "3x-ui 启动后进程消失"
+            [[ -f /var/log/x-ui.log ]] && tail -5 /var/log/x-ui.log 2>/dev/null | while IFS= read -r line; do echo "    $line"; done
         fi
-        log_warn "可尝试手动启动排查: /etc/init.d/x-ui start"
     fi
 }
 

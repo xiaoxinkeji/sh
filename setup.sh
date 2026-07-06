@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ============================================================================
-#  多服务一键部署脚本  v4.1.0
+#  多服务一键部署脚本  v4.2.0
 #  集成: Cloudflared Tunnel / Lucky(幸运加速) / 3x-ui (X-UI)
 #
 #  Init 支持: systemd / sysvinit / OpenRC
@@ -18,7 +18,7 @@
 set -uo pipefail
 
 # ========================== 全局变量 ==========================
-SCRIPT_VERSION="4.1.0"
+SCRIPT_VERSION="4.2.0"
 CLOUDFLARED_TOKEN=""
 INSTALL_CF=true
 INSTALL_LUCKY=true
@@ -27,6 +27,8 @@ CONF_DIR="/etc/services-deploy"
 TMP_FILES=()
 PUBLIC_IP=""          # 缓存公网 IP, 避免重复请求
 USE_COLOR=true        # 颜色输出开关 (非 TTY 时自动关闭)
+GH_MIRROR="https://xxxyyy.eu.org"   # GitHub 加速镜像 (Cloudflare Workers)
+USE_GH_MIRROR=false  # 是否强制使用镜像 (网络检测后自动设置)
 
 # 颜色 (非 TTY 时自动置空, 避免管道/重定向输出带乱码)
 if [[ -t 1 ]]; then
@@ -65,6 +67,9 @@ get_public_ip() {
     fi
     PUBLIC_IP="$(curl -s --max-time 5 ifconfig.me 2>/dev/null)"
     if [[ -z "$PUBLIC_IP" ]]; then
+        PUBLIC_IP="$(curl -s --max-time 5 ip.sb 2>/dev/null)"
+    fi
+    if [[ -z "$PUBLIC_IP" ]]; then
         PUBLIC_IP="$(curl -s --max-time 5 icanhazip.com 2>/dev/null)"
     fi
     if [[ -z "$PUBLIC_IP" ]]; then
@@ -93,45 +98,112 @@ _get_xui_version() {
     fi
 }
 
-# ---------- 带重试的下载 ----------
+# ---------- GitHub 加速镜像 ----------
+# 将 GitHub URL 转为镜像加速 URL
+# 支持 github.com 和 raw.githubusercontent.com
+_gh_mirror() {
+    local url="$1"
+    echo "${GH_MIRROR}/${url}"
+}
+
+# 智能选择下载 URL: 如果 USE_GH_MIRROR=true 或 URL 包含 github, 自动走镜像
+_smart_gh_url() {
+    local url="$1"
+    # 只对 GitHub 相关 URL 做处理
+    if [[ "$url" == *"github.com"* ]] || [[ "$url" == *"githubusercontent.com"* ]]; then
+        if $USE_GH_MIRROR; then
+            _gh_mirror "$url"
+        else
+            echo "$url"
+        fi
+    else
+        echo "$url"
+    fi
+}
+
+# ---------- 带重试的下载 (支持 GitHub 镜像自动回退) ----------
 # 用法: download_retry <url> <output> [max_retries]
 download_retry() {
     local url="$1" output="$2" retries="${3:-3}"
     local attempt=1
+    local is_gh=false
+    [[ "$url" == *"github.com"* ]] || [[ "$url" == *"githubusercontent.com"* ]] && is_gh=true
+
+    # 如果已标记走镜像, 直接转换 URL
+    if $is_gh && $USE_GH_MIRROR; then
+        url="$(_gh_mirror "$url")"
+    fi
+
     while (( attempt <= retries )); do
+        local tag="直连"
+        [[ "$url" == "$GH_MIRROR"* ]] && tag="镜像加速"
         if curl -fsSL --connect-timeout 15 --max-time 120 -o "$output" "$url" 2>/dev/null; then
             return 0
         fi
-        log_warn "下载失败 (第 ${attempt}/${retries} 次): $url"
+        log_warn "下载失败 [${tag}] (第 ${attempt}/${retries} 次): $url"
         (( attempt++ ))
         sleep $(( attempt - 1 ))
     done
-    log_error "下载最终失败: $url"
+
+    # 直连失败 + 是 GitHub URL + 还没走镜像 → 自动回退镜像
+    if $is_gh && ! $USE_GH_MIRROR; then
+        log_warn "直连失败, 自动切换镜像加速..."
+        local mirror_url="$(_gh_mirror "$1")"
+        attempt=1
+        while (( attempt <= retries )); do
+            if curl -fsSL --connect-timeout 15 --max-time 120 -o "$output" "$mirror_url" 2>/dev/null; then
+                log_success "镜像加速下载成功"
+                return 0
+            fi
+            log_warn "下载失败 [镜像加速] (第 ${attempt}/${retries} 次): $mirror_url"
+            (( attempt++ ))
+            sleep $(( attempt - 1 ))
+        done
+    fi
+
+    log_error "下载最终失败: $1"
     return 1
 }
 
 # ---------- 网络连通性预检 ----------
 check_network() {
     log_step "网络连通性检查"
-    local targets=("https://github.com" "https://raw.githubusercontent.com" "http://release.66666.host")
-    local ok=0 fail=0
+    local gh_ok=false
+    local other_targets=("http://release.66666.host")
+    local other_fail=0
 
-    for target in "${targets[@]}"; do
+    # 1) 检测 GitHub 连通性
+    if curl -fsS --connect-timeout 8 --max-time 15 -o /dev/null "https://github.com" 2>/dev/null; then
+        log_success "GitHub 可达 (直连下载)"
+        gh_ok=true
+    else
+        log_warn "GitHub 不可达, 将使用镜像加速"
+    fi
+
+    # 2) 如果 GitHub 不可达, 检测镜像加速是否可用
+    if ! $gh_ok; then
+        if curl -fsS --connect-timeout 8 --max-time 15 -o /dev/null "${GH_MIRROR}/https://github.com" 2>/dev/null; then
+            log_success "镜像加速可用: ${GH_MIRROR}"
+            USE_GH_MIRROR=true
+        else
+            log_warn "镜像加速也不可达, 下载可能失败"
+        fi
+    fi
+
+    # 3) 检测其他目标
+    for target in "${other_targets[@]}"; do
         if curl -fsS --connect-timeout 8 --max-time 15 -o /dev/null "$target" 2>/dev/null; then
             log_success "可达: $target"
-            (( ok++ ))
         else
             log_warn "不可达: $target"
-            (( fail++ ))
+            (( other_fail++ ))
         fi
     done
 
-    if (( fail == ${#targets[@]} )); then
+    # 4) 判断整体网络状态
+    if ! $gh_ok && (( other_fail == ${#other_targets[@]} )); then
         log_error "所有目标均不可达, 请检查网络连接"
         exit 1
-    fi
-    if (( fail > 0 )); then
-        log_warn "${fail} 个目标不可达, 部分服务可能安装失败"
     fi
 }
 

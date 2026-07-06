@@ -114,18 +114,18 @@ download_retry() {
     local is_gh=false
     [[ "$url" == *"github.com"* ]] || [[ "$url" == *"githubusercontent.com"* ]] && is_gh=true
 
-    # 如果已标记走镜像, 直接转换 URL
+    # 如果已标记走镜像, 先解析 latest 重定向, 避免镜像 302 回 github.com
     if $is_gh && $USE_GH_MIRROR; then
-        url="$(_gh_mirror "$url")"
+        url="$(_resolve_mirror_url "$url")"
     fi
 
     while (( attempt <= retries )); do
         local tag="直连"
         [[ "$url" == "$GH_MIRROR"* ]] && tag="镜像加速"
-        if curl -fsSL --connect-timeout 15 --max-time 120 -o "$output" "$url" 2>/dev/null; then
+        if curl -fsSL --connect-timeout 15 --max-time 300 -o "$output" "$url" 2>/dev/null; then
             return 0
         fi
-        log_warn "下载失败 [${tag}] (第 ${attempt}/${retries} 次): $url"
+        log_warn "下载失败 [${tag}] (第 ${attempt}/${retries} 次)"
         (( attempt++ ))
         sleep $(( attempt - 1 ))
     done
@@ -133,14 +133,15 @@ download_retry() {
     # 直连失败 + 是 GitHub URL + 还没走镜像 → 自动回退镜像
     if $is_gh && ! $USE_GH_MIRROR; then
         log_warn "直连失败, 自动切换镜像加速..."
-        local mirror_url="$(_gh_mirror "$1")"
+        local mirror_url
+        mirror_url="$(_resolve_mirror_url "$1")"
         attempt=1
         while (( attempt <= retries )); do
-            if curl -fsSL --connect-timeout 15 --max-time 120 -o "$output" "$mirror_url" 2>/dev/null; then
+            if curl -fsSL --connect-timeout 15 --max-time 300 -o "$output" "$mirror_url" 2>/dev/null; then
                 log_success "镜像加速下载成功"
                 return 0
             fi
-            log_warn "下载失败 [镜像加速] (第 ${attempt}/${retries} 次): $mirror_url"
+            log_warn "下载失败 [镜像加速] (第 ${attempt}/${retries} 次)"
             (( attempt++ ))
             sleep $(( attempt - 1 ))
         done
@@ -148,6 +149,27 @@ download_retry() {
 
     log_error "下载最终失败: $1"
     return 1
+}
+
+# 解析 GitHub URL 通过镜像, 处理 latest 重定向回 github.com 的问题
+# 输入: https://github.com/.../latest/download/...
+# 输出: https://xxxyyy.eu.org/https://github.com/.../download/2026.6.1/... (已解析版本)
+_resolve_mirror_url() {
+    local url="$1"
+    local mirror_url="$(_gh_mirror "$url")"
+
+    # 只用 -sI (不加 -L), 拿镜像返回的第一层 302 Location
+    # 不能用 -L, 因为重定向目标可能是 github.com (不通的话 curl 会卡死)
+    local location
+    location="$(curl -sI --connect-timeout 10 --max-time 15 "$mirror_url" 2>/dev/null | grep -i '^location:' | tail -1 | sed 's/^[Ll]ocation: *//;s/\r$//')"
+
+    if [[ -n "$location" ]] && [[ "$location" == *"github.com"* || "$location" == *"githubusercontent.com"* ]]; then
+        # 镜像把 latest 解析了, 但重定向目标回到 github.com → 重新走镜像
+        echo "$(_gh_mirror "$location")"
+    else
+        # 没有重定向, 或重定向到非 github 地址 (CDN), 直接用
+        echo "$mirror_url"
+    fi
 }
 
 # ---------- 网络连通性预检 ----------

@@ -891,18 +891,11 @@ install_dependencies() {
         return 0
     fi
 
-    # 等待 dpkg/apt 锁释放 (unattended-upgrades 等后台进程可能占用)
+    # 处理 dpkg 锁 (unattended-upgrades 等后台进程可能占用)
     if [[ "$PKG_MGR" == "apt" ]]; then
-        local lock_wait=0
-        while fuser /var/lib/dpkg/lock-frontend &>/dev/null 2>&1; do
-            if (( lock_wait >= 60 )); then
-                log_warn "dpkg 锁等待超时 (60s), 尝试继续..."
-                break
-            fi
-            log_info "等待 dpkg 锁释放... (${lock_wait}s)"
-            sleep 3
-            (( lock_wait += 3 ))
-        done
+        # 直接杀掉 unattended-upgrades, 它不重要
+        pkill -f unattended-upgrades 2>/dev/null || true
+        sleep 1
         # 确保 dpkg 配置完整
         dpkg --configure -a 2>/dev/null || true
     fi

@@ -5,10 +5,14 @@
 ## 一行安装
 
 ```bash
+# 直连 (GitHub 可达时)
 bash <(curl -fsSL https://raw.githubusercontent.com/xiaoxinkeji/sh/main/setup.sh)
+
+# 镜像加速 (GitHub 不通时)
+bash <(curl -fsSL https://xxxyyy.eu.org/https://raw.githubusercontent.com/xiaoxinkeji/sh/main/setup.sh)
 ```
 
-脚本会自动请求 root 权限，启动后进入交互式菜单选择要安装的服务。已安装的服务会自动标注 `[已安装]`。
+脚本会自动请求 root 权限，启动后进入交互式菜单选择要安装的服务。已安装的服务会自动标注 `[已安装]`。安装过程中如果 GitHub 下载失败，会自动切换镜像加速。
 
 ## 其他用法
 

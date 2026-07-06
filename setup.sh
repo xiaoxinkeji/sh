@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ============================================================================
-#  多服务一键部署脚本  v4.2.0
+#  多服务一键部署脚本  v4.2.1
 #  集成: Cloudflared Tunnel / Lucky(幸运加速) / 3x-ui (X-UI)
 #
 #  Init 支持: systemd / sysvinit / OpenRC
@@ -104,21 +104,6 @@ _get_xui_version() {
 _gh_mirror() {
     local url="$1"
     echo "${GH_MIRROR}/${url}"
-}
-
-# 智能选择下载 URL: 如果 USE_GH_MIRROR=true 或 URL 包含 github, 自动走镜像
-_smart_gh_url() {
-    local url="$1"
-    # 只对 GitHub 相关 URL 做处理
-    if [[ "$url" == *"github.com"* ]] || [[ "$url" == *"githubusercontent.com"* ]]; then
-        if $USE_GH_MIRROR; then
-            _gh_mirror "$url"
-        else
-            echo "$url"
-        fi
-    else
-        echo "$url"
-    fi
 }
 
 # ---------- 带重试的下载 (支持 GitHub 镜像自动回退) ----------
@@ -906,6 +891,22 @@ install_dependencies() {
         return 0
     fi
 
+    # 等待 dpkg/apt 锁释放 (unattended-upgrades 等后台进程可能占用)
+    if [[ "$PKG_MGR" == "apt" ]]; then
+        local lock_wait=0
+        while fuser /var/lib/dpkg/lock-frontend &>/dev/null 2>&1; do
+            if (( lock_wait >= 60 )); then
+                log_warn "dpkg 锁等待超时 (60s), 尝试继续..."
+                break
+            fi
+            log_info "等待 dpkg 锁释放... (${lock_wait}s)"
+            sleep 3
+            (( lock_wait += 3 ))
+        done
+        # 确保 dpkg 配置完整
+        dpkg --configure -a 2>/dev/null || true
+    fi
+
     case "$PKG_MGR" in
         apt)
             apt-get update -qq
@@ -1471,6 +1472,13 @@ install_3xui() {
     if download_retry "https://raw.githubusercontent.com/mhsanaei/3x-ui/master/install.sh" "$INSTALL_SCRIPT"; then
         chmod +x "$INSTALL_SCRIPT"
 
+        # 如果 GitHub 不可达, 替换脚本内部的 GitHub URL 为镜像加速
+        if $USE_GH_MIRROR; then
+            log_info "正在为 3x-ui 安装脚本注入镜像加速..."
+            sed -i "s|https://github.com/|${GH_MIRROR}/https://github.com/|g" "$INSTALL_SCRIPT"
+            sed -i "s|https://raw.githubusercontent.com/|${GH_MIRROR}/https://raw.githubusercontent.com/|g" "$INSTALL_SCRIPT"
+        fi
+
         log_info "执行 3x-ui 安装脚本 (自动模式)..."
         # 用 here-string 喂入 yes, 避免管道占用 stdin 导致脚本内部 read 异常
         bash "$INSTALL_SCRIPT" <<< "$(yes | head -20)" 2>&1 || true
@@ -1505,6 +1513,26 @@ install_3xui() {
         else
             log_error "3x-ui 启动后进程消失"
             [[ -f /var/log/x-ui.log ]] && tail -5 /var/log/x-ui.log 2>/dev/null | while IFS= read -r line; do echo "    $line"; done
+        fi
+    fi
+
+    # 显示 3x-ui 面板信息
+    if [[ -f /etc/x-ui/install-result.env ]]; then
+        local xui_user xui_pass xui_port xui_path public_ip
+        xui_user="$(_read_env_field /etc/x-ui/install-result.env XUI_USERNAME)"
+        xui_pass="$(_read_env_field /etc/x-ui/install-result.env XUI_PASSWORD)"
+        xui_port="$(_read_env_field /etc/x-ui/install-result.env XUI_PANEL_PORT)"
+        xui_path="$(_read_env_field /etc/x-ui/install-result.env XUI_WEB_BASE_PATH)"
+        public_ip="$(get_public_ip)"
+        if [[ -n "$xui_port" ]]; then
+            echo ""
+            divider
+            log_success "${BOLD}3x-ui 面板信息:${NC}"
+            echo -e "  ${CYAN}访问地址:${NC}  http://${public_ip}:${xui_port}/${xui_path}"
+            echo -e "  ${CYAN}用户名:${NC}    ${BOLD}${xui_user}${NC}"
+            echo -e "  ${CYAN}密码:${NC}      ${BOLD}${xui_pass}${NC}"
+            echo -e "  ${YELLOW}⚠ 请妥善保存以上凭据!${NC}"
+            divider
         fi
     fi
 }
@@ -1588,7 +1616,15 @@ show_status() {
     divider
 
     _print_svc_status "Cloudflared Tunnel" "cloudflared" "/usr/local/bin/cloudflared"
-    _print_svc_status "Lucky (幸运加速)"   "lucky"       "/usr/local/bin/lucky"
+
+    # Lucky 服务名可能是 lucky.daji (官方安装) 或 lucky (我们自己注册)
+    local lucky_svc="lucky"
+    if [[ -f /lib/systemd/system/lucky.daji.service ]] || \
+       [[ -f /etc/systemd/system/lucky.daji.service ]]; then
+        lucky_svc="lucky.daji"
+    fi
+    _print_svc_status "Lucky (幸运加速)"   "$lucky_svc"  "/usr/local/bin/lucky"
+
     _print_svc_status "3x-ui (X-UI 面板)"  "x-ui"        "/usr/local/x-ui/x-ui"
 
     # ---------- 显示访问信息 ----------

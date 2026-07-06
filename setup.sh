@@ -18,7 +18,7 @@
 set -uo pipefail
 
 # ========================== 全局变量 ==========================
-SCRIPT_VERSION="4.2.0"
+SCRIPT_VERSION="4.2.1"
 CLOUDFLARED_TOKEN=""
 INSTALL_CF=true
 INSTALL_LUCKY=true
@@ -1237,6 +1237,9 @@ EOF
 install_lucky() {
     log_step "2/3  安装 Lucky (幸运加速)"
 
+    # 用于跟踪实际的服务名 (官方脚本装的是 lucky.daji, 我们自己装的是 lucky)
+    local lucky_svc_name="lucky"
+
     # ---------- 尝试定位已有的二进制 (含官方脚本装到非标准路径的情况) ----------
     if ! command -v lucky &>/dev/null && [[ ! -f /usr/local/bin/lucky ]]; then
         _link_lucky_binary 2>/dev/null || true
@@ -1255,6 +1258,13 @@ install_lucky() {
             if sh "$INSTALL_SCRIPT" "$LUCKY_URL" 2>&1; then
                 log_success "Lucky 安装成功 (官方脚本)"
                 _link_lucky_binary
+
+                # 官方脚本会创建 lucky.daji.service, 检测并使用它
+                if [[ -f /lib/systemd/system/lucky.daji.service ]] || \
+                   [[ -f /etc/systemd/system/lucky.daji.service ]]; then
+                    lucky_svc_name="lucky.daji"
+                    log_info "检测到官方服务: lucky.daji.service"
+                fi
             else
                 log_warn "官方脚本安装失败, 尝试备用方案..."
                 _install_lucky_manual
@@ -1265,31 +1275,40 @@ install_lucky() {
         fi
     else
         log_info "Lucky 已安装, 跳过下载"
+        # 已安装的情况下也检测官方服务
+        if [[ -f /lib/systemd/system/lucky.daji.service ]] || \
+           [[ -f /etc/systemd/system/lucky.daji.service ]]; then
+            lucky_svc_name="lucky.daji"
+        fi
     fi
 
-    # ---------- 确保有对应的服务注册 ----------
-    _ensure_lucky_service
+    # ---------- 确保有对应的服务注册 (仅在没有官方服务时才创建) ----------
+    if [[ "$lucky_svc_name" == "lucky" ]]; then
+        _ensure_lucky_service
+    fi
 
     # ---------- 启动 ----------
     svc_daemon_reload
-    svc_enable lucky
-    svc_stop lucky 2>/dev/null
+    svc_enable "$lucky_svc_name"
+    svc_stop "$lucky_svc_name" 2>/dev/null
     sleep 1
 
     local start_rc=0
-    if [[ "$INIT_SYSTEM" == "sysvinit" || "$INIT_SYSTEM" == "openrc" ]]; then
-        "/etc/init.d/lucky" start || start_rc=$?
+    if [[ "$INIT_SYSTEM" == "sysvinit" || "$INIT_SYSTEM" == "openrc" ]] && [[ -x "/etc/init.d/$lucky_svc_name" ]]; then
+        "/etc/init.d/$lucky_svc_name" start || start_rc=$?
+    elif [[ "$INIT_SYSTEM" == "systemd" ]]; then
+        svc_start "$lucky_svc_name" || start_rc=$?
     else
-        svc_start lucky || start_rc=$?
+        svc_start "$lucky_svc_name" || start_rc=$?
     fi
 
     if (( start_rc != 0 )); then
-        log_warn "init.d 启动失败, 尝试直接启动..."
-        _direct_start lucky /usr/local/bin/lucky - -cd /etc/lucky
+        log_warn "服务启动失败, 尝试直接启动..."
+        _direct_start "$lucky_svc_name" /usr/local/bin/lucky - -cd /etc/lucky
     else
         sleep 2
-        if svc_status lucky /usr/local/bin/lucky; then
-            log_success "Lucky 服务运行正常"
+        if svc_status "$lucky_svc_name" /usr/local/bin/lucky; then
+            log_success "Lucky 服务运行正常 (${lucky_svc_name})"
         else
             log_error "Lucky 启动后进程消失"
             [[ -f /var/log/lucky.log ]] && tail -5 /var/log/lucky.log 2>/dev/null | while IFS= read -r line; do echo "    $line"; done
@@ -1775,9 +1794,16 @@ do_repair() {
         fi
     }
 
+    # 检测 Lucky 实际的服务名 (官方安装的是 lucky.daji, 我们自己装的是 lucky)
+    local lucky_repair_svc="lucky"
+    if [[ -f /lib/systemd/system/lucky.daji.service ]] || \
+       [[ -f /etc/systemd/system/lucky.daji.service ]]; then
+        lucky_repair_svc="lucky.daji"
+    fi
+
     _repair_svc "Cloudflared Tunnel" "cloudflared" "/usr/local/bin/cloudflared" \
         - "tunnel" "--no-autoupdate" "run" "--token" "$CLOUDFLARED_TOKEN"
-    _repair_svc "Lucky (幸运加速)"   "lucky"       "/usr/local/bin/lucky" \
+    _repair_svc "Lucky (幸运加速)"   "$lucky_repair_svc" "/usr/local/bin/lucky" \
         - "-cd" "/etc/lucky"
     _repair_svc "3x-ui (X-UI 面板)"  "x-ui"        "/usr/local/x-ui/x-ui" \
         "/usr/local/x-ui"
@@ -1922,6 +1948,8 @@ do_uninstall() {
     if $do_lucky; then
         log_step "卸载 Lucky"
 
+        # 停止所有可能的 Lucky 服务 (官方 lucky.daji + 自生成 lucky)
+        _uninstall_stop lucky.daji
         _uninstall_stop lucky
 
         # Lucky 官方卸载脚本
@@ -1939,6 +1967,8 @@ do_uninstall() {
         rm -f /etc/init.d/lucky
         rm -f /etc/systemd/system/lucky.service
         rm -f /lib/systemd/system/lucky.service
+        rm -f /etc/systemd/system/lucky.daji.service
+        rm -f /lib/systemd/system/lucky.daji.service
         rm -f /var/run/lucky.pid
         rm -rf /var/log/lucky
 
